@@ -106,12 +106,20 @@ The four checkpoints stay private in the Backblaze bucket. Each worker downloads
 4. **Worker group:** one GPU with ≥ 12 GB and bf16 support (compute capability 8.x/9.x), a driver that supports CUDA ≥ 12.6, and a price cap of `dph<=0.15`.
    In practice that means an RTX 3060 or A4000 at about $0.06–0.10/hr. Without the cap, Vast picked an RTX 4090 at $0.45/hr.
 
-**Measured on Vast (RTX 4090, `000_003.mp4`):**
-- **Result:** DEEPFAKE 99.76%, 3-clip logits 11.88 / 11.86 / 12.26 (training recorded 11.63 / 11.94 / 12.31).
-- **Speed:** the analysis itself takes about 2 s.
-- **First cold start:** about 13 minutes, covering the GPU rental, the image pull and the model download from Backblaze. The first run also spent about 5 minutes installing OpenSSH, which the image now preinstalls.
-5. **Website server:** `VAST_API_KEY=<key> VAST_ENDPOINT=originai-detectors uvicorn server:app --port 8000`.
-   If the static site is hosted elsewhere, set `window.ORIGINAI_API_BASE = "https://<api-host>"` before `scanner.js` loads.
+**Measured on Vast (every frame analysed):**
+
+| Video | GPU | Decoder | Worker time |
+|---|---|---|---|
+| `000_003.mp4`, 16 s, 640×480, 396 frames | RTX 4090 | CPU (FF++ files are H.264 4:4:4, which NVDEC can't decode) | 2.4 s |
+| 2 min 1440×1080 H.264 4:4:4, 3,168 frames | RTX A4000 ($0.09/hr) | CPU fallback | 54 s |
+| 2 min 1440×1080 H.264 4:2:0 (typical upload), 3,168 frames | RTX A4000 ($0.09/hr) | NVDEC | **22 s** (decode fully hidden; detection 9 s; model 9 s) |
+
+The first request after the endpoint scales to zero also waits for a cold start of about 5–10 minutes.
+
+**Operating notes:**
+- **Pin image tags.** Point the template at `cu126-<commit>`, not `cu126` or `latest`: Vast hosts cache tags that are re-pointed and can start an old image.
+- **Replace workers after changing the template or image.** Updating the worker group's template recycles its workers. A recycled worker can keep a stale routing signature and answer every request with HTTP 401, so destroy the endpoint's workers (`vastai destroy instance <id> -y`) and let fresh ones start.
+- **The Backblaze key lives in your Vast account environment variables** (`B2_KEY_ID`, `B2_APP_KEY`; set them with `set_vast_b2_env.sh`), not in the template.
 
 Changing scale later takes one command (or the Vast console), for example `vastai update endpoint <id> --max_workers 2`.
 When the Backblaze key is replaced, update the template's `B2_KEY_ID` / `B2_APP_KEY`; new workers pick it up.
