@@ -6,25 +6,30 @@
 # RTX 50-series (Blackwell) hosts need the CUDA 13.0 build (host driver >= 580): TORCH_CUDA=cu130.
 FROM ubuntu:24.04
 
+# NVIDIA_DRIVER_CAPABILITIES must include "video" so the container runtime mounts the
+# driver's NVDEC library (libnvcuvid) used for GPU video decoding.
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PATH=/opt/venv/bin:$PATH \
     TORCH_HOME=/app/torch \
-    MODEL_LOG=/var/log/originai/model.log
+    MODEL_LOG=/var/log/originai/model.log \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
 
 # python3.12 is Ubuntu 24.04's system Python (the thesis used 3.12).
 # git/curl/openssl are required by Vast's PyWorker start script. openssh-server is
 # preinstalled so Vast's SSH launch mode does not spend minutes installing it on
-# every new host (it added ~5 min to the first cold start).
+# every new host (it added ~5 min to the first cold start). ffmpeg provides the
+# shared libraries torchcodec uses for demuxing and CPU-fallback decoding.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        python3 python3-venv git curl openssl ca-certificates libglib2.0-0 \
+        python3 python3-venv git curl openssl ca-certificates libglib2.0-0 ffmpeg \
     && apt-get install -y openssh-server \
     && rm -rf /var/lib/apt/lists/* \
     && python3 -m venv /opt/venv
 
 ARG TORCH_CUDA=cu126
-RUN pip install --index-url https://download.pytorch.org/whl/${TORCH_CUDA} torch==2.12.1 torchvision==0.27.1
+RUN pip install --index-url https://download.pytorch.org/whl/${TORCH_CUDA} \
+        torch==2.12.1 torchvision==0.27.1 torchcodec==0.16.0
 
 COPY model_server/requirements.txt /app/requirements.txt
 RUN pip install -r /app/requirements.txt \
@@ -42,7 +47,8 @@ RUN chmod +x /onstart.sh && mkdir -p /var/log/originai /app/weights && cd /app &
 import hashlib, json, os
 import facenet_pytorch
 from torchvision.models.video import swin3d_b  # noqa: F401
-import detector  # noqa: F401  (imports cleanly)
+import detector, gpu_mtcnn, video_io  # noqa: F401  (import cleanly)
+from torchcodec.decoders import VideoDecoder, set_cuda_backend  # noqa: F401
 # MTCNN weights must match the thesis preprocessing registry.
 expected = {
     "pnet.pt": "a2a71925e0b9996a42f63e47efc1ca19043e69558b5c523b978d611dfae49c8f",

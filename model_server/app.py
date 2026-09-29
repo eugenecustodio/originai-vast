@@ -135,8 +135,10 @@ def analyze(req: AnalyzeRequest) -> dict:
             raise HTTPException(500, "Inference failed on the model server.")
     result["status"] = "completed"
     result["seconds"] = round(time.time() - t, 2)
+    coverage = result.get("coverage", {})
     log.info(
-        "Analyzed with %s: %s p=%.4f clips=%d in %.1fs",
-        req.model, result["pred"], result["prob_fake"], len(result["clips"]), result["seconds"],
+        "Analyzed with %s: %s p=%.4f frames=%s clips=%s decoder=%s in %.1fs %s",
+        req.model, result["pred"], result["prob_fake"], coverage.get("frames_analyzed"),
+        coverage.get("clips"), coverage.get("decoder"), result["seconds"], result.get("timings"),
     )
     return result

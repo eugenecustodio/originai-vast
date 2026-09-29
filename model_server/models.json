@@ -99,21 +99,27 @@
     }
   },
   "whole_video": {
-    "_comment": "Whole-video coverage: frames every frame_spacing_s, tiled into 16-frame clips with 50% overlap; clips never bridge gaps longer than max_gap_factor x spacing.",
-    "clip_stride": 8,
-    "max_gap_factor": 4.0
+    "_comment": "Every decoded frame is analysed. Frames are split into k interleaved phases (k = round(frame_spacing_s x fps)) so each 16-frame clip has the trained spacing; each phase is tiled with clip_stride_in_phase. Clips never bridge face gaps longer than max_gap_factor x spacing. Videos above max_frames are subsampled evenly.",
+    "clip_stride_in_phase": 16,
+    "max_gap_factor": 4.0,
+    "max_frames": 7200
   },
   "inference": {
-    "batch_size_cuda": 8,
-    "batch_size_cpu": 2
+    "_comment": "Swin clips per GPU batch (>=20 GB cards / smaller cards / CPU), FaceNet batch, pixel budget per face-detection batch, and NVDEC decoding (falls back to CPU decoding automatically).",
+    "batch_size_cuda": 16,
+    "batch_size_cuda_small": 8,
+    "batch_size_cpu": 2,
+    "embed_batch": 256,
+    "detect_pixel_budget": 40000000,
+    "gpu_decode": true
   },
   "heatmap": {
-    "_comment": "Evidence maps: exact final-stage token contributions for the top_k most suspicious clips (+ the least suspicious), oriented toward the verdict. Shown relative to this video: values at or below low_percentile are clear, high_percentile is full strength.",
+    "_comment": "Evidence maps: exact final-stage token contributions for the top_k most suspicious clips (spread over the video) + the least suspicious, oriented toward the verdict, rendered and JPEG-encoded on the GPU. Shown relative to this video: values at or below low_percentile are clear, high_percentile is full strength.",
     "top_k": 4,
     "include_lowest": true,
     "low_percentile": 50,
     "high_percentile": 99.5,
-    "frame_width": 640,
+    "frame_width": 480,
     "jpeg_quality": 82
   }
 }

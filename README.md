@@ -23,35 +23,34 @@ Browser ──multipart──► website server.py ──JSON (base64 video)─�
 in `Thesis_Code/src/swinfusionpp/p11_metric_stage.py`. Δ is the median per-video frame spacing
 of each model's training split (`manifests/preprocessing_materialization_v001.parquet`).
 
-## Preprocessing: the frozen thesis contract
+## Preprocessing: the frozen thesis contract, on the GPU
 
 Ported from `Thesis_Code/src/swinfusionpp/preprocessing.py` and
 `configs/preprocessing/policy_v001.yaml` (policy `preprocessing_v001`), and stored in
-`model_server/models.json → policy`. Do not change these values.
+`model_server/models.json → policy`. The heavy steps run on the GPU and were verified against
+the original CPU code:
 
-- **Decode:** PyAV 16.0.1, taking the first decoded frame at or after each requested timestamp.
-- **Faces:** facenet-pytorch 2.6.0 MTCNN (`min_face_size=40`, thresholds `[0.6, 0.7, 0.7]`, `factor=0.709`), keeping detections with probability ≥ 0.90.
-- **Alignment:** five-landmark similarity transform to the ArcFace template, 224×224 RGB uint8, linear interpolation, reflect-101 padding.
-- **Identity tracking:** FaceNet vggface2 embeddings (cosine distance ≤ 0.55 or IoU ≥ 0.10, ambiguity margin 0.05, EMA 0.9).
-- **Model:** torchvision `swin3d_b` fed 16 frames (B×16×3×224×224). ImageNet mean/std is applied inside the checkpoint's normalizer, then `Linear(1024 → 1)`.
+| Step | Implementation | Check against training |
+|---|---|---|
+| Decode | torchcodec: NVDEC on the GPU. Falls back to FFmpeg or PyAV on the CPU | CPU decode is bit-identical to the thesis PyAV rgb24 frames (40/40) |
+| Face detection | `gpu_mtcnn.py`: facenet-pytorch 2.6.0 MTCNN, same weights and thresholds. Stages 2 and 3 crop every box in one gather using an exact summed-area table instead of a Python loop | Identical boxes, probabilities and landmarks (max difference 0 at 640×480 and 1080p) |
+| Alignment | Fixed-point bilinear warp on the GPU to the ArcFace template, 224×224, REFLECT_101 | Pixel-identical to OpenCV 4.11 `warpAffine` (60/60 crops) |
+| Identity tracking | FaceNet vggface2 embeddings on the GPU; the thesis tracker logic runs on the CPU (tiny) | Same rule and thresholds |
 
-**Verified against training.** Your test video `000_003.mp4` is in the FF++ C23 test split:
-- **Frame selection:** our 48 selected frames have the same timestamps and decoded-frame indices as the training cache.
-- **Face crops:** re-aligned with training's recorded landmarks, the crops are bit-identical (48/48).
-- **Landmarks:** MTCNN on CPU differs from the GPU landmarks by 0.07 px on average.
-- **Logits:** the 3-clip logits are 11.79 / 11.94 / 12.27, against 11.63 / 11.94 / 12.31 recorded in training (bf16).
+The model is torchvision `swin3d_b` on 16 frames (B×16×3×224×224) with a `Linear(1024 → 1)` head, run in bf16 on the GPU as in training.
 
-## Whole-video analysis (the model only sees 16 frames)
+**Verified on `000_003.mp4`** (FF++ C23 test split): the thesis 3-clip logits are 11.785 / 11.944 / 12.271, against 11.63 / 11.94 / 12.31 recorded in training (bf16).
 
-1. **Whole video (drives the verdict).**
-   - Frames are sampled every Δ seconds from 2% to 98% of the duration, which keeps each clip at the frame spacing the model was trained on, even for a 2-minute video.
-   - The primary face is tracked and the track is tiled into 16-frame clips with a stride of 8 (50% overlap), plus a final clip flush with the end.
-   - Clips never bridge a gap longer than 4Δ, for example when the face leaves the shot.
-   - Verdict: mean of all clip logits → `sigmoid(mean / T)` → threshold. That is the thesis read-out.
-2. **Benchmark protocol (shown next to it).**
-   - The exact thesis evaluation: 64 timestamps → track → 48 frames → three anchors `[0:16] [16:32] [32:48]`.
-   - It is reported as "Benchmark protocol · 3 clips", or "Not available" if fewer than 48 face frames were tracked.
-   - If whole-video tiling finds too few face frames but this protocol works, its anchors are used for the verdict instead (`coverage.fallback`).
+## Every frame is analysed
+
+The model only accepts 16 frames at the spacing it was trained on (0.245–0.345 s apart), so
+the video is split into **interleaved phases**:
+- **Phases:** phase *p* holds frames *p*, *p+k*, *p+2k*, … where *k* = round(spacing × fps). For example, 25 fps with 0.34 s spacing gives k = 8.
+- **Clips:** each phase is tiled into 16-frame clips, and each phase starts at a different offset so clip centres spread evenly through the video. Every face frame is scored in at least one clip, and always at the trained spacing.
+- **Verdict:** mean of all clip logits → `sigmoid(mean / T)` → threshold, the thesis read-out.
+- **Timeline:** each bar averages the clips centred in a half-clip window.
+- **Benchmark protocol:** the exact thesis evaluation (64 timestamps → 48 tracked frames → three anchors) is reported next to it.
+- **Limits:** videos over `max_frames` (7,200) are subsampled evenly. Clips never bridge a face gap longer than 4× the spacing.
 
 Portrait phone videos are rotated upright before face detection.
 
@@ -59,18 +58,17 @@ Portrait phone videos are rotated upright before face detection.
 
 **How they're computed:**
 - The Video Swin-B head is LayerNorm → average pool → linear.
-- So each final-stage token (8×7×7 per clip) contributes exactly `w · LayerNorm(token)` to the clip logit, and the mean of those contributions plus the bias equals the logit (checked to 1e-6).
-- This class activation map equals Grad-CAM taken at the final norm layer. It needs no backward pass and costs about 2 s extra on CPU.
+- So each final-stage token (8×7×7 per clip) contributes exactly `w · LayerNorm(token)` to the clip logit, and the mean of those contributions plus the bias is the logit.
+- This equals Grad-CAM at the final norm layer and comes free with scoring.
 
 **What's rendered:**
-- Maps are oriented toward the verdict and made for the 4 most suspicious clips plus the least suspicious one.
-- They are scaled together, relative within the video: at or below the median is clear, the 99.5th percentile is full strength.
-- Each clip shows 8 frames, the first frame of each 2-frame tubelet, over both the original video frame and the 224×224 face crop the model saw.
+- Maps are made for the 4 most suspicious clips spread over the video, plus the least suspicious, and scaled relative within the video.
+- Each clip shows 8 frames (one per 2-frame tubelet).
+- Rendering happens on the GPU: the heat is blended into the video frame and the face crop and JPEG-encoded with nvJPEG. The page's opacity slider mixes the plain and blended images, which is equivalent to scaling the overlay.
 
 **Limits:**
 - The resolution is 7×7 per tubelet, so maps show regions, not pixels.
 - Brightness is relative, so it's a guide, not a measurement.
-- Clip probabilities are calibrated with the video-level temperature, so they're approximate per clip.
 
 ## Worker API (`model_server/app.py`)
 
@@ -78,10 +76,10 @@ Portrait phone videos are rotated upright before face detection.
 
 **Success** returns:
 - `status: "completed"`, `pred`, `prob_fake`, `raw_prob_fake`, `threshold`, `temperature`, `video_logit`
-- `clips[{index, start_s, end_s, logit, prob, heatmap}]`
+- `clips[{index, start_s, end_s, logit, prob, clips, heatmap}]` (timeline windows)
 - `protocol{available, pred, prob_fake, clip_logits | reason, message}`
-- `coverage{duration, fps, width, height, frame_spacing_s, face_frames, segments, clips, clip_stride, analyzed_start_s, analyzed_end_s, fallback}`
-- `heatmaps{target, frame_size, stops, clips[{clip_index, role, frames[{t, frame_jpg, frame_heat_png, crop_jpg, crop_heat_png}]}]}` (base64 images, about 5 MB)
+- `coverage{mode, decoder, device, frames_decoded, frames_analyzed, face_frames, phases, frame_spacing_s, clips, analyzed_start_s, analyzed_end_s, fallback, …}`
+- `heatmaps{target, frame_size, stops, clips[{clip_index, role, clip_start_s, clip_end_s, clip_prob, frames[{t, frame_jpg, frame_heat_jpg, crop_jpg, crop_heat_jpg}]}]}` (base64 JPEGs, about 2 MB)
 - `timings`
 
 **Failure** returns `{"status": "failed", "reason", "error"}`, where `reason` is one of:
