@@ -93,8 +93,9 @@ class TorchcodecSource:
             if self._fix_rotation is None:  # does this build turn frames upright itself?
                 h, w = data.shape[2:]
                 self._fix_rotation = self._turn in (1, 3) and (w, h) == (self._raw_w, self._raw_h)
-                if getattr(self.decoder, "cpu_fallback", None):
-                    self.name = "torchcodec-cpu-fallback"
+                fallback = getattr(self.decoder, "cpu_fallback", None)
+                if fallback:  # NVDEC could not be used; torchcodec decoded on the CPU instead
+                    self.name = f"{self.name} -> CPU ({str(fallback).split('due to: ')[-1]})"
             if self._fix_rotation:
                 data = torch.rot90(data, self._turn, dims=(2, 3))
             yield data, frames.pts_seconds.double().cpu().numpy(), np.arange(start, stop)
@@ -134,6 +135,17 @@ class PyAVSource:
                     buf, pts, idx = [], [], []
         if buf:
             yield torch.stack(buf).permute(0, 3, 1, 2).to(self.device), np.array(pts), np.array(idx)
+
+
+def nvdec_diagnostics() -> dict:
+    """Why NVDEC may be unavailable: driver capabilities and the NVCUVID library."""
+    import ctypes.util
+    import os
+
+    return {
+        "NVIDIA_DRIVER_CAPABILITIES": os.environ.get("NVIDIA_DRIVER_CAPABILITIES"),
+        "libnvcuvid": ctypes.util.find_library("nvcuvid"),
+    }
 
 
 def open_source(path: Path, device: torch.device, prefer_gpu: bool = True):

@@ -35,6 +35,7 @@ import base64
 import contextlib
 import json
 import math
+import queue
 import threading
 import time
 from dataclasses import dataclass, field
@@ -49,7 +50,7 @@ from torchvision.io import encode_jpeg
 from torchvision.models.video import swin3d_b
 
 from gpu_mtcnn import detect_faces
-from video_io import open_source
+from video_io import nvdec_diagnostics, open_source
 
 FAILURE_MESSAGES = {
     "metadata_error": "The video's duration could not be read.",
@@ -472,6 +473,7 @@ class DenseVideo:
     previews: torch.Tensor  # (M, 3, ph, pw) uint8 on the compute device
     preview_size: tuple[int, int]
     preview_scale: float
+    timings: dict[str, float]
 
 
 class FacePipeline:
@@ -515,11 +517,20 @@ class FacePipeline:
         budget = int(self.cfg["detect_pixel_budget"])
         return int(min(32, max(2, budget // max(1, height * width))))
 
+    def _sync(self) -> float:
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        return time.perf_counter()
+
     @torch.inference_mode()
     def _process_batch(self, frames: torch.Tensor, records: list[FrameRecord], state: dict) -> None:
         """Detect, align, embed and keep previews for one batch of frames (all on the GPU)."""
+        timing = state["timing"]
+        t = self._sync()
         height, width = frames.shape[2:]
         results = detect_faces(frames, self.min_face, self.pnet, self.rnet, self.onet, self.thresholds, self.factor)
+        t1 = self._sync()
+        timing["detect"] += t1 - t
         inds, mats, meta = [], [], []
         for position, (record, (boxes, probs, points)) in enumerate(zip(records, results)):
             record.detected = len(boxes) > 0
@@ -554,6 +565,8 @@ class FacePipeline:
                         record=record,
                     )
                 )
+        t2 = self._sync()
+        timing["align_embed"] += t2 - t1
         pw, ph = state["preview_size"]
         previews = frames.float() if (pw, ph) == (width, height) else F.interpolate(frames.float(), size=(ph, pw), mode="area")
         previews = previews.round().clamp(0, 255).to(torch.uint8)
@@ -566,6 +579,7 @@ class FacePipeline:
         for record in records:
             record.preview_index = state["preview_count"]
             state["preview_count"] += 1
+        timing["previews"] += self._sync() - t2
 
     def read(self, path: Path, spacing: float) -> DenseVideo:
         cfg = self.cfg
@@ -592,6 +606,7 @@ class FacePipeline:
         ph = max(2, int(round(info.height * preview_scale)))
         capacity = expected // subsample + len(targets) + 8
         state = {
+            "timing": {"decode_wait": 0.0, "detect": 0.0, "align_embed": 0.0, "previews": 0.0},
             "crops": [], "crop_count": 0, "preview_count": 0, "preview_size": (pw, ph),
             "previews": torch.empty((capacity, 3, ph, pw), dtype=torch.uint8, device=self.device),
         }
@@ -608,8 +623,35 @@ class FacePipeline:
                 pending.clear()
                 pending_records.clear()
 
+        # Decode the next batches in a background thread while the GPU works on this one.
+        batches: queue.Queue = queue.Queue(maxsize=3)
+        stop = threading.Event()
+
+        def produce() -> None:
+            try:
+                for item in source.batches(batch_size):
+                    if stop.is_set():
+                        return
+                    batches.put(item)
+            except Exception as exc:  # surfaced in the consumer below
+                batches.put(exc)
+            finally:
+                batches.put(None)
+
+        producer = threading.Thread(target=produce, name="decode", daemon=True)
+        producer.start()
+
+        def next_batch():
+            started = time.perf_counter()
+            item = batches.get()
+            state["timing"]["decode_wait"] += time.perf_counter() - started
+            if isinstance(item, Exception):
+                raise item
+            return item
+
         try:
-            for data, pts, idx in source.batches(batch_size):
+            while (item := next_batch()) is not None:
+                data, pts, idx = item
                 for j in range(len(pts)):
                     decoded += 1
                     t, index = float(pts[j]), int(idx[j])
@@ -641,6 +683,14 @@ class FacePipeline:
             if not records:
                 raise AnalysisFailed("decode_failed")
             flush()
+        finally:
+            # Stop the decoder thread and drain the queue so it never blocks holding frames.
+            stop.set()
+            while producer.is_alive():
+                try:
+                    batches.get(timeout=0.2)
+                except queue.Empty:
+                    pass
         if not records:
             raise AnalysisFailed("decode_failed")
 
@@ -661,6 +711,7 @@ class FacePipeline:
             previews=previews,
             preview_size=(pw, ph),
             preview_scale=preview_scale,
+            timings=dict(state["timing"]),
         )
 
     def track(self, frames: list[FrameRecord], minimum: int) -> tuple[list[Candidate], int]:
@@ -882,6 +933,7 @@ class DetectorService:
         if self.device.type == "cuda":
             torch.cuda.synchronize()
         timings["decode_detect_align"] = time.perf_counter() - t0
+        timings.update({f"stage_{k}": v for k, v in video.timings.items()})
 
         # Thesis protocol: 64 -> track -> 48 -> three anchors.
         t = time.perf_counter()
@@ -1028,6 +1080,7 @@ class DetectorService:
                 "rotation": video.rotation,
                 "decoder": video.decoder,
                 "device": str(self.device),
+                "nvdec": nvdec_diagnostics() if self.device.type == "cuda" else None,
                 "frames_decoded": video.frames_decoded,
                 "frames_analyzed": dense_frames,
                 "subsample": video.subsample,
