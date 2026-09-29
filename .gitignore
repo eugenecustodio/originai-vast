@@ -1,0 +1,4 @@
+# Model weights are downloaded from Backblaze at worker start (see model_server/fetch_weights.py).
+model_server/weights/
+__pycache__/
+*.pyc

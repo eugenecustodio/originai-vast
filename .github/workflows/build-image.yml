@@ -1,0 +1,61 @@
+name: Build worker image
+
+on:
+  push:
+    branches: [main]
+    paths: ["Dockerfile", "onstart.sh", "model_server/**", ".github/workflows/build-image.yml"]
+  workflow_dispatch:
+    inputs:
+      torch_cuda:
+        description: "PyTorch CUDA build: cu126 (RTX 30/40, A-series) or cu130 (RTX 50-series, driver >= 580)"
+        type: choice
+        options: [cu126, cu130]
+        default: cu126
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Free disk space for the CUDA image
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          df -h /
+
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image tags
+        id: meta
+        run: |
+          CUDA="${{ inputs.torch_cuda || 'cu126' }}"
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/originai-worker"
+          SHORT="${GITHUB_SHA::7}"
+          if [ "$CUDA" = "cu126" ]; then
+            TAGS="$IMAGE:latest,$IMAGE:cu126,$IMAGE:cu126-$SHORT"
+          else
+            TAGS="$IMAGE:cu130,$IMAGE:cu130-$SHORT"
+          fi
+          echo "cuda=$CUDA" >> "$GITHUB_OUTPUT"
+          echo "tags=$TAGS" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          build-args: TORCH_CUDA=${{ steps.meta.outputs.cuda }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.description=OriginAI Video Swin-B deepfake detectors (code only; weights fetched at start)

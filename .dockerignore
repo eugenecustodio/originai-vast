@@ -1,0 +1,5 @@
+.git
+.github
+model_server/weights
+**/__pycache__
+*.md

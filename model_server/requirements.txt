@@ -1,0 +1,11 @@
+# Pinned to the thesis environments (Thesis_Code/uv.lock and environments/p05/uv.lock).
+# torch==2.12.1 / torchvision==0.27.1 are installed from the PyTorch CUDA index (see Dockerfile).
+numpy==1.26.4
+pillow==10.2.0
+opencv-python-headless==4.11.0.86
+av==16.0.1
+tqdm==4.67.1
+requests
+fastapi==0.129.0
+uvicorn[standard]==0.41.0
+# facenet-pytorch==2.6.0 pins torch<2.3, so it is installed with --no-deps (see Dockerfile)

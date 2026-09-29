@@ -1,0 +1,119 @@
+{
+  "_comment": "Served Video Swin-B checkpoints. temperature/threshold come from each '<name> - operating point.json' (validation temperature scaling + max-Youden threshold on the calibrated probability). frame_spacing_s = median per-video frame spacing of that model's training split (preprocessing_materialization_v001.parquet).",
+  "weights_source": {
+    "_comment": "Private Backblaze B2 bucket; workers download each checkpoint at start with a read-only key (B2_KEY_ID / B2_APP_KEY) and verify its SHA-1. These are byte-identical to the local checkpoint files.",
+    "provider": "backblaze-b2",
+    "bucket": "salik-digma"
+  },
+  "models": [
+    {
+      "id": "veni-hq",
+      "name": "Veni HQ",
+      "dataset": "FaceForensics++ C23 (HQ)",
+      "checkpoint": "FF++ C23.pt",
+      "temperature": 1.9924885052003003,
+      "threshold": 0.5248124511241848,
+      "frame_spacing_s": 0.34,
+      "b2_path": "Thesis_Code/results/within__ffpp_c23__video_swin_b__fixed_v002__seed3109/checkpoints/selected.pt",
+      "sha1": "e74a4493847d8cf8f9389b4cb394a9fce91637b1"
+    },
+    {
+      "id": "veni-lq",
+      "name": "Veni LQ",
+      "dataset": "FaceForensics++ C40 (LQ)",
+      "checkpoint": "FF++ C40.pt",
+      "temperature": 2.5594629377233202,
+      "threshold": 0.48931823188817947,
+      "frame_spacing_s": 0.34,
+      "b2_path": "Thesis_Code/results/within__ffpp_c40__video_swin_b__fixed_v002__seed1701/checkpoints/selected.pt",
+      "sha1": "8f46ddfb455369edc68bf53d10cb32f90afad798"
+    },
+    {
+      "id": "vidi",
+      "name": "Vidi",
+      "dataset": "Celeb-DF v2",
+      "checkpoint": "Celeb-DF v2.pt",
+      "temperature": 5.015759065810373,
+      "threshold": 0.22864833964158293,
+      "frame_spacing_s": 0.245,
+      "b2_path": "Thesis_Code/results/within__celeb_df_v2__video_swin_b__fixed_v002__seed1701/checkpoints/selected.pt",
+      "sha1": "6b7f9743cbfb9285ec2f3e1acdf815b9d243a450"
+    },
+    {
+      "id": "vici",
+      "name": "Vici",
+      "dataset": "DeeperForensics-1.0",
+      "checkpoint": "DeeperForensics-1.0.pt",
+      "temperature": 1.395588533559042,
+      "threshold": 0.8321618813027107,
+      "frame_spacing_s": 0.345,
+      "b2_path": "Thesis_Code/results/within__deeperforensics_1_0__video_swin_b__fixed_v002__seed2203/checkpoints/selected.pt",
+      "sha1": "9bf3217532bc09f8ff35c3aea236fba1d59d6c0a"
+    }
+  ],
+  "policy": {
+    "_comment": "Frozen thesis preprocessing policy preprocessing_v001 (configs/preprocessing/policy_v001.yaml, hash 5610fc20...5632). Do not change.",
+    "policy_id": "preprocessing_v001",
+    "decoder": {
+      "backend": "pyav",
+      "timestamp_convention": "nearest_decoded_frame_at_or_after_uniform_target",
+      "candidate_frame_count": 64,
+      "edge_fraction": 0.02
+    },
+    "face_detection": {
+      "implementation": "facenet_pytorch.MTCNN",
+      "inference_batch_size": {
+        "default": 16,
+        "high_resolution": 32,
+        "high_resolution_min_pixels": 2000000
+      },
+      "min_face_size": 40,
+      "thresholds": [
+        0.6,
+        0.7,
+        0.7
+      ],
+      "factor": 0.709,
+      "minimum_confidence": 0.9
+    },
+    "alignment": {
+      "alignment_version": "five_landmark_similarity_v001",
+      "crop_margin_version": "arcface_canonical_template_fixed_margin_v001",
+      "output_height": 224,
+      "output_width": 224,
+      "interpolation": "linear",
+      "padding": "reflect_101"
+    },
+    "tracking": {
+      "embedding_model": "facenet_pytorch.InceptionResnetV1_vggface2",
+      "maximum_cosine_distance": 0.55,
+      "minimum_iou_for_spatial_fallback": 0.1,
+      "ambiguity_margin": 0.05,
+      "embedding_ema": 0.9
+    },
+    "evidence": {
+      "maximum_cached_frames": 48,
+      "minimum_valid_frames": 48,
+      "clip_length": 16,
+      "evaluation_clip_count": 3
+    }
+  },
+  "whole_video": {
+    "_comment": "Whole-video coverage: frames every frame_spacing_s, tiled into 16-frame clips with 50% overlap; clips never bridge gaps longer than max_gap_factor x spacing.",
+    "clip_stride": 8,
+    "max_gap_factor": 4.0
+  },
+  "inference": {
+    "batch_size_cuda": 8,
+    "batch_size_cpu": 2
+  },
+  "heatmap": {
+    "_comment": "Evidence maps: exact final-stage token contributions for the top_k most suspicious clips (+ the least suspicious), oriented toward the verdict. Shown relative to this video: values at or below low_percentile are clear, high_percentile is full strength.",
+    "top_k": 4,
+    "include_lowest": true,
+    "low_percentile": 50,
+    "high_percentile": 99.5,
+    "frame_width": 640,
+    "jpeg_quality": 82
+  }
+}
