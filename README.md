@@ -105,7 +105,13 @@ The four checkpoints stay private in the Backblaze bucket. Each worker downloads
    - Docker options: `-p 3000:3000 -e PYWORKER_REPO=<this repo> -e B2_KEY_ID=… -e B2_APP_KEY=…`
    - on-start: `bash /onstart.sh`
 3. **Endpoint, lowest-cost test settings:** `min_load 0` (scale to zero), `cold_workers 0`, `max_workers 1`, `inactivity_timeout 300`.
-4. **Worker group:** the cheapest reliable single GPU with ≥ 12 GB and a driver that supports CUDA ≥ 12.6.
+4. **Worker group:** one GPU with ≥ 12 GB and bf16 support (compute capability 8.x/9.x), a driver that supports CUDA ≥ 12.6, and a price cap of `dph<=0.15`.
+   In practice that means an RTX 3060 or A4000 at about $0.06–0.10/hr. Without the cap, Vast picked an RTX 4090 at $0.45/hr.
+
+**Measured on Vast (RTX 4090, `000_003.mp4`):**
+- **Result:** DEEPFAKE 99.76%, 3-clip logits 11.88 / 11.86 / 12.26 (training recorded 11.63 / 11.94 / 12.31).
+- **Speed:** the analysis itself takes about 2 s.
+- **First cold start:** about 13 minutes, covering the GPU rental, the image pull and the model download from Backblaze. The first run also spent about 5 minutes installing OpenSSH, which the image now preinstalls.
 5. **Website server:** `VAST_API_KEY=<key> VAST_ENDPOINT=originai-detectors uvicorn server:app --port 8000`.
    If the static site is hosted elsewhere, set `window.ORIGINAI_API_BASE = "https://<api-host>"` before `scanner.js` loads.
 
