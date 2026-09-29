@@ -14,9 +14,12 @@ ENV DEBIAN_FRONTEND=noninteractive \
     MODEL_LOG=/var/log/originai/model.log
 
 # python3.12 is Ubuntu 24.04's system Python (the thesis used 3.12).
-# git/curl/openssl are required by Vast's PyWorker start script.
+# git/curl/openssl are required by Vast's PyWorker start script. openssh-server is
+# preinstalled so Vast's SSH launch mode does not spend minutes installing it on
+# every new host (it added ~5 min to the first cold start).
 RUN apt-get update && apt-get install -y --no-install-recommends \
         python3 python3-venv git curl openssl ca-certificates libglib2.0-0 \
+    && apt-get install -y openssh-server \
     && rm -rf /var/lib/apt/lists/* \
     && python3 -m venv /opt/venv
 
