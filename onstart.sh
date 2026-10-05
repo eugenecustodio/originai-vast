@@ -1,6 +1,6 @@
 #!/bin/bash
 # Vast.ai template on-start script:
-#   1. download the four checkpoints from Backblaze (verified by SHA-1),
+#   1. download the checkpoints in models.json from Backblaze (verified by SHA-1),
 #   2. start the model server,
 #   3. start the Vast PyWorker (it watches $MODEL_LOG for readiness/errors).
 export MODEL_LOG="${MODEL_LOG:-/var/log/originai/model.log}"

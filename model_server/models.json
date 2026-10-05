@@ -1,7 +1,7 @@
 {
-  "_comment": "Served Video Swin-B checkpoints. temperature/threshold come from each '<name> - operating point.json' (validation temperature scaling + max-Youden threshold on the calibrated probability). frame_spacing_s = median per-video frame spacing of that model's training split (preprocessing_materialization_v001.parquet).",
+  "_comment": "Served checkpoints. arch says which code reads a checkpoint: video_swin_b (the default, detector.py) or dfd_fcg (dfd_fcg.py). For the Video Swin-B models, temperature/threshold come from each '<name> - operating point.json' (validation temperature scaling + max-Youden threshold on the calibrated probability) and frame_spacing_s = median per-video frame spacing of that model's training split (preprocessing_materialization_v001.parquet). Vidi is DFD-FCG (Han et al., CVPR 2025; the authors' published checkpoint, trained on FaceForensics++ C23, research use only): it has no validation run of ours, so it is read at its own decision rule (temperature 1, threshold 0.5), and its frame_spacing_s is the spacing of its 10 training frames over 3 seconds.",
   "weights_source": {
-    "_comment": "Private Backblaze B2 bucket; workers download each checkpoint at start with a read-only key (B2_KEY_ID / B2_APP_KEY) and verify its SHA-1. These are byte-identical to the local checkpoint files.",
+    "_comment": "Private Backblaze B2 bucket; workers download each checkpoint at start with a read-only key (B2_KEY_ID / B2_APP_KEY) and verify its SHA-1. These are byte-identical to the local checkpoint files. DFD-FCG.ckpt is weights.ckpt from the authors' checkpoint.zip, unchanged.",
     "provider": "backblaze-b2",
     "bucket": "salik-digma"
   },
@@ -31,13 +31,14 @@
     {
       "id": "vidi",
       "name": "Vidi",
-      "dataset": "Celeb-DF v2",
-      "checkpoint": "Celeb-DF v2.pt",
-      "temperature": 5.015759065810373,
-      "threshold": 0.22864833964158293,
-      "frame_spacing_s": 0.245,
-      "b2_path": "Thesis_Code/results/within__celeb_df_v2__video_swin_b__fixed_v002__seed1701/checkpoints/selected.pt",
-      "sha1": "6b7f9743cbfb9285ec2f3e1acdf815b9d243a450"
+      "arch": "dfd_fcg",
+      "dataset": "FaceForensics++ C23 (DFD-FCG)",
+      "checkpoint": "DFD-FCG.ckpt",
+      "temperature": 1.0,
+      "threshold": 0.5,
+      "frame_spacing_s": 0.33,
+      "b2_path": "OriginAI/models/dfd-fcg/weights.ckpt",
+      "sha1": "e3bbb42930560ef351af93750950464cd7f8d9e2"
     },
     {
       "id": "vici",
@@ -97,6 +98,17 @@
       "clip_length": 16,
       "evaluation_clip_count": 3
     }
+  },
+  "dfd_fcg": {
+    "_comment": "DFD-FCG (arch dfd_fcg). landmarks: the 2D-FAN TorchScript file of face_alignment 1.4.1, which the Dockerfile downloads into the image. Clips are 10 frames; each phase is tiled with clip_stride_in_phase. batch_clips_*: clips per pass through the CLIP ViT-L/14 encoder (>=20 GB cards / smaller cards / CPU).",
+    "landmarks": {
+      "file": "2DFAN4-cd938726ad.zip",
+      "sha256": "cd938726adb1f15f361263cce2db9cb820c42585fa8796ec72ce19107f369a46"
+    },
+    "clip_stride_in_phase": 10,
+    "batch_clips_cuda": 8,
+    "batch_clips_cuda_small": 4,
+    "batch_clips_cpu": 1
   },
   "whole_video": {
     "_comment": "Every decoded frame is analysed. Frames are split into k interleaved phases (k = round(frame_spacing_s x fps)) so each 16-frame clip has the trained spacing; each phase is tiled with clip_stride_in_phase. Clips never bridge face gaps longer than max_gap_factor x spacing. Videos above max_frames are subsampled evenly.",

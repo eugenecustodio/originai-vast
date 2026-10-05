@@ -1,5 +1,8 @@
-"""Video Swin-B deepfake detector: thesis preprocessing on the GPU, every-frame scoring,
-evidence maps.
+"""The deepfake detectors: face pipeline on the GPU, every-frame scoring, evidence maps.
+
+Two kinds of model are served (``arch`` in models.json): the thesis's Video Swin-B
+detectors, described below, and DFD-FCG (dfd_fcg.py), which reads its own face crop and
+10-frame clips but shares the decoding, face detection, tracking, timeline and rendering.
 
 Preprocessing reproduces the training repository
 (Thesis_Code/src/swinfusionpp/preprocessing.py, policy ``preprocessing_v001``) with the
@@ -49,6 +52,7 @@ from torch import nn
 from torchvision.io import encode_jpeg
 from torchvision.models.video import swin3d_b
 
+import dfd_fcg
 from gpu_mtcnn import detect_faces
 from video_io import nvdec_diagnostics, open_source
 
@@ -131,14 +135,17 @@ class ModelEntry:
     temperature: float
     threshold: float
     frame_spacing_s: float
-    net: VideoSwinDetector
+    net: nn.Module
     epoch: int | None = None
     metrics: dict | None = None
+    arch: str = "video_swin_b"
+    clip_length: int = 16
 
     def public_info(self) -> dict:
         return {
             "id": self.id,
             "name": self.name,
+            "arch": self.arch,
             "dataset": self.dataset,
             "threshold": self.threshold,
             "frame_spacing_s": self.frame_spacing_s,
@@ -182,6 +189,7 @@ class Candidate:
     # Additions for the web service (unused by tracking):
     matrix: np.ndarray  # full-frame -> crop similarity transform
     record: FrameRecord
+    points68: np.ndarray | None = None  # 2D-FAN landmarks, only read for DFD-FCG
 
 
 @dataclass(frozen=True)
@@ -375,31 +383,47 @@ def _reflect101(v: torch.Tensor, n: int) -> torch.Tensor:
 
 
 def warp_faces(flat_frames: torch.Tensor, height: int, width: int, frame_inds: torch.Tensor,
-               mats: np.ndarray, size: int, chunk: int = 32) -> torch.Tensor:
+               mats: np.ndarray, size: int, chunk: int = 32, offsets: np.ndarray | None = None,
+               zero_border: bool = False) -> torch.Tensor:
     """Aligned crops (N, size, size, 3) uint8 from frames laid out as (B, H*W, 3).
 
     Fixed-point bilinear exactly as OpenCV computes it (AB_BITS=10, INTER_BITS=5,
     15-bit coefficients), verified pixel-identical to cv2.warpAffine 4.11.
+
+    ``offsets`` (N, 2): each crop is the size x size window whose top-left corner is (x, y)
+    of the warped image, i.e. cv2.warpAffine(...)[y : y + size, x : x + size]. The border is
+    BORDER_REFLECT_101, or BORDER_CONSTANT 0 with ``zero_border``.
     """
     device = flat_frames.device
     inv = torch.from_numpy(_invert_affine(mats)).to(device)
     coords = torch.arange(size, dtype=torch.float64, device=device)
+    origin = None if offsets is None else torch.as_tensor(np.asarray(offsets, dtype=np.float64), device=device)
     out = []
     for s in range(0, len(mats), chunk):
         m = inv[s : s + chunk]
         b = frame_inds[s : s + chunk].long()[:, None, None]
-        adelta = torch.round(m[:, 0, 0, None] * coords * 1024).long()
-        bdelta = torch.round(m[:, 1, 0, None] * coords * 1024).long()
-        x0 = torch.round((m[:, 0, 1, None] * coords + m[:, 0, 2, None]) * 1024).long() + 16
-        y0 = torch.round((m[:, 1, 1, None] * coords + m[:, 1, 2, None]) * 1024).long() + 16
+        xs = coords if origin is None else origin[s : s + chunk, 0:1] + coords
+        ys = coords if origin is None else origin[s : s + chunk, 1:2] + coords
+        adelta = torch.round(m[:, 0, 0, None] * xs * 1024).long()
+        bdelta = torch.round(m[:, 1, 0, None] * xs * 1024).long()
+        x0 = torch.round((m[:, 0, 1, None] * ys + m[:, 0, 2, None]) * 1024).long() + 16
+        y0 = torch.round((m[:, 1, 1, None] * ys + m[:, 1, 2, None]) * 1024).long() + 16
         xx = (x0[:, :, None] + adelta[:, None, :]) >> 5  # rows = output y, cols = output x
         yy = (y0[:, :, None] + bdelta[:, None, :]) >> 5
         ix, fx, iy, fy = xx >> 5, xx & 31, yy >> 5, yy & 31
-        c0, c1 = _reflect101(ix, width), _reflect101(ix + 1, width)
-        r0, r1 = _reflect101(iy, height), _reflect101(iy + 1, height)
+        if zero_border:
+            c0, c1, r0, r1 = ix, ix + 1, iy, iy + 1
 
-        def px(r, c):
-            return flat_frames[b, r * width + c].long()
+            def px(r, c):
+                inside = (r >= 0) & (r < height) & (c >= 0) & (c < width)
+                values = flat_frames[b, r.clamp(0, height - 1) * width + c.clamp(0, width - 1)].long()
+                return values * inside[..., None]
+        else:
+            c0, c1 = _reflect101(ix, width), _reflect101(ix + 1, width)
+            r0, r1 = _reflect101(iy, height), _reflect101(iy + 1, height)
+
+            def px(r, c):
+                return flat_frames[b, r * width + c].long()
 
         acc = (
             px(r0, c0) * ((32 - fx) * (32 - fy))[..., None]
@@ -502,6 +526,7 @@ class FacePipeline:
         self.embedder.requires_grad_(False)
         self.size = int(policy["alignment"]["output_height"])
         self.template = canonical_landmarks(self.size)
+        self.landmarker: dfd_fcg.Landmarker | None = None  # set by the service when DFD-FCG is served
 
     @torch.inference_mode()
     def _embed(self, crops: torch.Tensor) -> np.ndarray:
@@ -544,11 +569,18 @@ class FacePipeline:
                 inds.append(position)
                 mats.append(matrix)
                 meta.append((record, tuple(map(float, box)), float(prob), pts))
+        landmark_time = 0.0
         if mats:
             flat = frames.permute(0, 2, 3, 1).reshape(len(frames), height * width, 3)
             crops = warp_faces(flat, height, width, torch.tensor(inds, device=frames.device), np.stack(mats), self.size)
             del flat
             embeddings = self._embed(crops)
+            points68 = None
+            if state["landmarks"]:
+                started = self._sync()
+                points68 = self.landmarker(frames, inds, dfd_fcg.sfd_boxes(np.array([m[1] for m in meta])))
+                landmark_time = self._sync() - started
+                timing["landmarks"] += landmark_time
             base = state["crop_count"]
             state["crops"].append(crops)
             state["crop_count"] += len(crops)
@@ -563,10 +595,11 @@ class FacePipeline:
                         embedding=embedding,
                         matrix=matrix,
                         record=record,
+                        points68=points68[k] if points68 is not None and np.isfinite(points68[k]).all() else None,
                     )
                 )
         t2 = self._sync()
-        timing["align_embed"] += t2 - t1
+        timing["align_embed"] += t2 - t1 - landmark_time
         pw, ph = state["preview_size"]
         previews = frames.float() if (pw, ph) == (width, height) else F.interpolate(frames.float(), size=(ph, pw), mode="area")
         previews = previews.round().clamp(0, 255).to(torch.uint8)
@@ -581,7 +614,8 @@ class FacePipeline:
             state["preview_count"] += 1
         timing["previews"] += self._sync() - t2
 
-    def read(self, path: Path, spacing: float) -> DenseVideo:
+    def read(self, path: Path, spacing: float, landmarks: bool = False) -> DenseVideo:
+        """``landmarks``: also find each face's 68 landmarks (DFD-FCG crops the face from them)."""
         cfg = self.cfg
         decoder_cfg = self.policy["decoder"]
         try:
@@ -609,7 +643,10 @@ class FacePipeline:
             "timing": {"decode_wait": 0.0, "detect": 0.0, "align_embed": 0.0, "previews": 0.0},
             "crops": [], "crop_count": 0, "preview_count": 0, "preview_size": (pw, ph),
             "previews": torch.empty((capacity, 3, ph, pw), dtype=torch.uint8, device=self.device),
+            "landmarks": landmarks and self.landmarker is not None,
         }
+        if state["landmarks"]:
+            state["timing"]["landmarks"] = 0.0
         records: list[FrameRecord] = []
         pending: list[torch.Tensor] = []
         pending_records: list[FrameRecord] = []
@@ -734,6 +771,43 @@ class FacePipeline:
             )
         return result.candidates, result.ambiguous_frames
 
+    @torch.inference_mode()
+    def canvas_crops(self, path: Path, faces: list[Candidate], geometry: list[tuple[np.ndarray, int, int]],
+                     size: int) -> tuple[torch.Tensor, np.ndarray]:
+        """Read the video a second time and cut each tracked face's crop straight from its
+        full-resolution frame: ``cv2.warpAffine(frame, matrix, canvas)[top : top + size, left : left + size]``
+        with a black border, for ``geometry[i] = (matrix, left, top)``.
+
+        The crops depend on landmarks from the frames around each one and on which face the
+        tracker settles on, both only known once the whole video has been read; warping the
+        original frame once (instead of re-sampling a stored crop) keeps the pixels the model
+        sees the same as in its training data.
+
+        Returns the crops (len(faces), size, size, 3) uint8 on the compute device and which of
+        them could be read."""
+        rows = {c.record.frame_index: row for row, c in enumerate(faces)}
+        crops = torch.zeros((len(faces), size, size, 3), dtype=torch.uint8, device=self.device)
+        done = np.zeros(len(faces), dtype=bool)
+        try:
+            source, info = open_source(path, self.device, prefer_gpu=bool(self.cfg.get("gpu_decode", True)))
+            for data, _, idx in source.batches(self._detection_batch(info.height, info.width)):
+                wanted = [(position, rows[int(i)]) for position, i in enumerate(idx) if int(i) in rows]
+                if not wanted:
+                    continue
+                height, width = data.shape[2:]
+                flat = data.permute(0, 2, 3, 1).reshape(len(data), height * width, 3)
+                target = [row for _, row in wanted]
+                crops[torch.tensor(target, device=self.device)] = warp_faces(
+                    flat, height, width, torch.tensor([position for position, _ in wanted], device=self.device),
+                    np.stack([geometry[row][0] for row in target]), size,
+                    offsets=np.array([geometry[row][1:] for row in target]), zero_border=True,
+                )
+                done[target] = True
+        except Exception:
+            if not done.any():
+                raise AnalysisFailed("decode_failed")
+        return crops, done
+
 
 def phase_clips(track: list[Candidate], phases: int, clip_length: int, stride: int, max_gap: float) -> tuple[list[list[Candidate]], int]:
     """Tile each interleaved phase of the dense track into ``clip_length``-frame clips.
@@ -771,6 +845,11 @@ def _sigmoid(x: float) -> float:
     return 1.0 / (1.0 + math.exp(-x)) if x >= 0 else math.exp(x) / (1.0 + math.exp(x))
 
 
+def _logit(p: float) -> float:
+    p = min(max(p, 1e-6), 1.0 - 1e-6)
+    return math.log(p / (1.0 - p))
+
+
 class DetectorService:
     def __init__(self, registry_path: Path, weights_dir: Path, device: str = "auto", only: list[str] | None = None) -> None:
         cfg = json.loads(registry_path.read_text(encoding="utf-8"))
@@ -787,11 +866,16 @@ class DetectorService:
         self.clip_length = int(self.policy["evidence"]["clip_length"])
         self.faces = FacePipeline(self.policy, self.device, {**self.inference_cfg, **self.whole,
                                                               "preview_width": self.heatmap_cfg["frame_width"]})
+        self.fcg_cfg = cfg.get("dfd_fcg", {})
         self.models: dict[str, ModelEntry] = {}
         for m in cfg["models"]:
             if only and m["id"] not in only:
                 continue
-            net, ckpt = load_model(weights_dir / m["checkpoint"], self.device)
+            arch = m.get("arch", "video_swin_b")
+            if arch == "dfd_fcg":
+                net, ckpt = dfd_fcg.load_dfd_fcg(weights_dir / m["checkpoint"], self.device)
+            else:
+                net, ckpt = load_model(weights_dir / m["checkpoint"], self.device)
             self.models[m["id"]] = ModelEntry(
                 id=m["id"],
                 name=m["name"],
@@ -802,14 +886,21 @@ class DetectorService:
                 net=net,
                 epoch=ckpt.get("epoch"),
                 metrics=ckpt.get("metrics"),
+                arch=arch,
+                clip_length=dfd_fcg.NUM_FRAMES if arch == "dfd_fcg" else self.clip_length,
             )
+        if any(entry.arch == "dfd_fcg" for entry in self.models.values()):
+            self.faces.landmarker = dfd_fcg.Landmarker(
+                dfd_fcg.landmark_weights(weights_dir, self.fcg_cfg["landmarks"]["file"]), self.device)
         if self.device.type == "cuda":
             self.amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
             memory_gb = torch.cuda.get_device_properties(self.device).total_memory / 2**30
             self.batch_size = int(self.inference_cfg["batch_size_cuda" if memory_gb >= 20 else "batch_size_cuda_small"])
+            self.fcg_batch = int(self.fcg_cfg.get("batch_clips_cuda" if memory_gb >= 20 else "batch_clips_cuda_small", 4))
         else:
             self.amp_dtype = None
             self.batch_size = int(self.inference_cfg["batch_size_cpu"])
+            self.fcg_batch = int(self.fcg_cfg.get("batch_clips_cpu", 1))
         lut = torch.from_numpy(HEAT_LUT.astype(np.float32)).to(self.device)
         self._lut_rgb, self._lut_alpha = lut[:, :3], lut[:, 3] / 255.0
         feather = _edge_feather(self.faces.size)
@@ -839,6 +930,26 @@ class DetectorService:
             maps.append(contributions)
         return torch.cat(logits).double().cpu().numpy(), torch.cat(maps)
 
+    @torch.inference_mode()
+    def _score_fcg(self, net: dfd_fcg.DfdFcg, crops: torch.Tensor, clip_index: torch.Tensor,
+                   evidence: bool = True) -> tuple[np.ndarray, np.ndarray, torch.Tensor | None]:
+        """DFD-FCG clip scores: fake probabilities, their log-odds and, if asked for, each
+        clip's evidence (K x 10 x 16 x 16, on device). ``clip_index`` (K, 10) holds rows of
+        ``crops``, the 150 x 150 face crops. The image encoder runs in half precision on the
+        GPU, as in the authors' evaluation."""
+        probs, logits, maps = [], [], []
+        for i in range(0, len(clip_index), self.fcg_batch):
+            rows = clip_index[i : i + self.fcg_batch]
+            x = dfd_fcg.prepare_frames(crops[rows.flatten()]).unflatten(0, tuple(rows.shape))
+            with torch.autocast("cuda", dtype=torch.float16) if self.device.type == "cuda" else contextlib.nullcontext():
+                out = net(x, evidence=evidence)
+            probs.append(out["prob_fake"])
+            logits.append(out["logit"])
+            if evidence:
+                maps.append(out["evidence"])
+        return (torch.cat(probs).double().cpu().numpy(), torch.cat(logits).double().cpu().numpy(),
+                torch.cat(maps) if evidence else None)
+
     def _warm_up(self) -> None:
         """Compile/initialise every CUDA kernel once so the first request is not slow."""
         frames = torch.randint(0, 255, (2, 3, 360, 640), dtype=torch.uint8, device=self.device)
@@ -846,35 +957,57 @@ class DetectorService:
         crops = torch.randint(0, 255, (self.clip_length, self.faces.size, self.faces.size, 3), dtype=torch.uint8, device=self.device)
         self.faces._embed(crops[:2])
         index = torch.arange(self.clip_length, device=self.device)[None]
-        for entry in list(self.models.values())[:1]:
+        for entry in [e for e in self.models.values() if e.arch == "video_swin_b"][:1]:
             self._score(entry.net, crops, index)
+        for entry in [e for e in self.models.values() if e.arch == "dfd_fcg"][:1]:
+            self.faces.landmarker(frames, [0, 1], np.array([[200.0, 80.0, 440.0, 320.0]] * 2))
+            faces = torch.randint(0, 255, (entry.clip_length, dfd_fcg.CROP_SIZE, dfd_fcg.CROP_SIZE, 3), dtype=torch.uint8, device=self.device)
+            self._score_fcg(entry.net, faces, torch.arange(entry.clip_length, device=self.device)[None])
         _jpegs(crops[:1].permute(0, 3, 1, 2), 80)
         torch.cuda.synchronize()
 
     # -- evidence maps -------------------------------------------------------
+    def _moment_frames(self, video: DenseVideo, entry: ModelEntry, clip: list[Candidate], slots: int,
+                       face_crops: torch.Tensor | None, face_rows: dict[int, int] | None,
+                       geometry: list[tuple[np.ndarray, int, int]] | None) -> tuple[list[Candidate], torch.Tensor, np.ndarray]:
+        """The frames an evidence map is drawn on: each one's candidate, the face crop the
+        model saw (S x size x size x 3 uint8) and its frame -> crop transform.
+
+        Video Swin: one map per 2-frame tubelet, shown on the tubelet's first frame.
+        DFD-FCG: one map per frame, on its 150 x 150 crop resized to the model's 224 x 224 input."""
+        if entry.arch == "dfd_fcg":
+            rows = [face_rows[id(c)] for c in clip]
+            shown = face_crops[torch.tensor(rows, device=self.device)].permute(0, 3, 1, 2).float()
+            shown = F.interpolate(shown, size=(self.faces.size, self.faces.size), mode="bicubic", align_corners=False, antialias=True)
+            crops = shown.clamp_(0, 255).round_().to(torch.uint8).permute(0, 2, 3, 1)
+            return clip, crops, np.stack([dfd_fcg.input_matrix(*geometry[row]) for row in rows])
+        step = entry.clip_length // slots
+        chosen = [clip[s * step] for s in range(slots)]
+        crops = video.crops[torch.tensor([c.crop_index for c in chosen], device=self.device)]
+        return chosen, crops, np.stack([c.matrix for c in chosen])
+
     @torch.inference_mode()
-    def _render(self, video: DenseVideo, clip: list[Candidate], relative: torch.Tensor) -> list[dict]:
-        """Eight frames per clip (the first frame of each 2-frame tubelet), rendered on the GPU.
+    def _render(self, video: DenseVideo, chosen: list[Candidate], relative: torch.Tensor, crops: torch.Tensor,
+                mats: np.ndarray) -> list[dict]:
+        """One picture set per evidence map, rendered on the GPU (Video Swin: eight per clip, the
+        first frame of each 2-frame tubelet). ``crops`` and ``mats`` come from ``_moment_frames``.
 
         Each heat image is the frame with the evidence blended in; the page stacks it over the
         plain frame and its opacity slider mixes the two, which equals scaling the overlay alpha.
         """
         size = self.faces.size
         quality = int(self.heatmap_cfg["jpeg_quality"])
-        slots = relative.shape[0]
-        step = self.clip_length // slots
-        chosen = [clip[s * step] for s in range(slots)]
         heat = F.interpolate(relative[:, None].float(), size=(size, size), mode="bicubic", align_corners=False).clamp(0, 1)[:, 0]
         q = (heat * 255).round().long()
         rgb = self._lut_rgb[q].permute(0, 3, 1, 2)  # (S,3,size,size)
         alpha = (self._lut_alpha[q] * self._feather)[:, None]  # (S,1,size,size)
 
-        crops = video.crops[torch.tensor([c.crop_index for c in chosen], device=self.device)].permute(0, 3, 1, 2).float()
+        crops = crops.permute(0, 3, 1, 2).float()
         crop_heat = (crops * (1 - alpha) + rgb * alpha).round().clamp(0, 255).to(torch.uint8)
 
         previews = video.previews[torch.tensor([c.record.preview_index for c in chosen], device=self.device)].float()
         ph, pw = previews.shape[2:]
-        mats = torch.from_numpy(np.stack([c.matrix for c in chosen]).astype(np.float64)).to(self.device)
+        mats = torch.from_numpy(np.asarray(mats).astype(np.float64)).to(self.device)
         mats[:, :, :2] /= video.preview_scale  # preview pixels -> crop pixels
         ys, xs = torch.meshgrid(torch.arange(ph, device=self.device, dtype=torch.float64),
                                 torch.arange(pw, device=self.device, dtype=torch.float64), indexing="ij")
@@ -925,68 +1058,109 @@ class DetectorService:
                 if self.device.type == "cuda":
                     torch.cuda.empty_cache()
 
+    def _readout_fcg(self, entry: ModelEntry, probs: np.ndarray) -> dict:
+        """DFD-FCG's video score is the mean of its clips' fake probabilities (the authors' rule)."""
+        mean = float(np.mean(probs))
+        calibrated = _sigmoid(_logit(mean) / entry.temperature)
+        return {
+            "video_logit": _logit(mean),
+            "prob_fake": calibrated,
+            "raw_prob_fake": mean,
+            "pred": "DEEPFAKE" if calibrated >= entry.threshold else "REAL",
+        }
+
+    def _score_video_fcg(self, video_path: Path, video: DenseVideo, entry: ModelEntry, dense: list[FrameRecord],
+                         phases: int, spacing: float, timings: dict[str, float]) -> dict:
+        """DFD-FCG on every frame: follow the face, cut its 150 x 150 crop from each frame, split
+        the frames into interleaved phases at the trained spacing and tile each phase into
+        10-frame clips. The authors' own evaluation (one clip per whole 3 seconds) is reported
+        alongside as ``protocol``."""
+        t = time.perf_counter()
+        track, ambiguous = self.faces.track(dense, entry.clip_length)
+        track = [c for c in track if c.points68 is not None]
+        geometry = dfd_fcg.crop_geometry(
+            np.stack([c.points68 for c in track]) if track else np.empty((0, 68, 2), np.float32),
+            np.array([c.record.frame_index for c in track], dtype=np.int64), video.frames_decoded)
+        kept = [i for i, g in enumerate(geometry) if g is not None]
+        track, geometry = [track[i] for i in kept], [geometry[i] for i in kept]
+        if len(track) < entry.clip_length:
+            raise AnalysisFailed("insufficient_valid_frames")
+        timings["tracking"] = time.perf_counter() - t
+
+        t = time.perf_counter()
+        crops, done = self.faces.canvas_crops(video_path, track, geometry, dfd_fcg.CROP_SIZE)
+        if not done.all():
+            kept = np.flatnonzero(done).tolist()
+            track, geometry = [track[i] for i in kept], [geometry[i] for i in kept]
+            crops = crops[torch.tensor(kept, device=self.device)]
+        clips, segments = phase_clips(
+            track, phases, entry.clip_length, int(self.fcg_cfg.get("clip_stride_in_phase", entry.clip_length)),
+            float(self.whole["max_gap_factor"]) * max(spacing, entry.frame_spacing_s),
+        )
+        if not clips:
+            raise AnalysisFailed("insufficient_valid_frames")
+        if self.device.type == "cuda":
+            torch.cuda.synchronize()
+        timings["face_crops"] = time.perf_counter() - t
+
+        t = time.perf_counter()
+        rows = {id(c): row for row, c in enumerate(track)}
+        index = torch.tensor([[rows[id(c)] for c in clip] for clip in clips], device=self.device)
+        probs, logits, maps = self._score_fcg(entry.net, crops, index)
+        if self.device.type == "cuda":
+            torch.cuda.synchronize()
+        timings["inference"] = time.perf_counter() - t
+
+        # The authors' evaluation: one clip per whole 3 seconds, 10 frames spread evenly over it.
+        t = time.perf_counter()
+        by_frame = {c.record.frame_index: row for row, c in enumerate(track)}
+        windows = dfd_fcg.protocol_frames(video.frames_decoded, video.fps or len(dense) / max(video.duration, 1e-6))
+        usable = [w for w in windows if all(frame in by_frame for frame in w)]
+        protocol: dict[str, Any] = {"available": False, "clip_count": len(usable), "windows": len(windows)}
+        if usable:
+            p_index = torch.tensor([[by_frame[frame] for frame in w] for w in usable], device=self.device)
+            p_probs, _, _ = self._score_fcg(entry.net, crops, p_index, evidence=False)
+            protocol.update(self._readout_fcg(entry, p_probs))
+            protocol.update(available=True, clip_probs=[float(v) for v in p_probs], track_frames=len(track))
+        else:
+            protocol.update(reason="insufficient_valid_clips", message=FAILURE_MESSAGES["insufficient_valid_clips"])
+        timings["protocol"] = time.perf_counter() - t
+        return {
+            "protocol": protocol, "clips": clips, "track": track, "ambiguous": ambiguous, "segments": segments,
+            "fallback": None, "logits": logits, "probs": probs, "maps": maps, "readout": self._readout_fcg(entry, probs),
+            "face_crops": crops, "face_rows": rows, "geometry": geometry,
+        }
+
     def _analyze(self, video_path: Path, entry: ModelEntry) -> dict:
         timings: dict[str, float] = {}
         t0 = time.perf_counter()
         hc = self.heatmap_cfg
-        video = self.faces.read(video_path, entry.frame_spacing_s)
+        fcg = entry.arch == "dfd_fcg"
+        video = self.faces.read(video_path, entry.frame_spacing_s, landmarks=fcg)
         if self.device.type == "cuda":
             torch.cuda.synchronize()
         timings["decode_detect_align"] = time.perf_counter() - t0
         timings.update({f"stage_{k}": v for k, v in video.timings.items()})
 
-        # Thesis protocol: 64 -> track -> 48 -> three anchors.
-        t = time.perf_counter()
-        evidence = self.policy["evidence"]
-        protocol: dict[str, Any] = {"available": False, "clip_count": int(evidence["evaluation_clip_count"])}
-        selected: list[Candidate] = []
-        anchors: list[list[int]] = []
-        try:
-            p_track, _ = self.faces.track(video.protocol_frames, int(evidence["minimum_valid_frames"]))
-            selected = [p_track[i] for i in deterministic_selection_indices(len(p_track), int(evidence["maximum_cached_frames"]))]
-            anchors = evaluation_anchors(len(selected), self.clip_length, int(evidence["evaluation_clip_count"]))
-            if len(anchors) != int(evidence["evaluation_clip_count"]):
-                raise AnalysisFailed("insufficient_valid_clips")
-            index = torch.tensor([[selected[i].crop_index for i in a] for a in anchors], device=self.device)
-            logits, _ = self._score(entry.net, video.crops, index)
-            protocol.update(self._readout(entry, logits))
-            protocol.update(available=True, clip_logits=[float(v) for v in logits], track_frames=len(p_track))
-        except AnalysisFailed as exc:
-            protocol.update(reason=exc.reason, message=str(exc))
-
-        timings["protocol"] = time.perf_counter() - t
-
-        # Every frame: track the face through all analysed frames, split into phases at the
-        # trained spacing, tile each phase into 16-frame clips.
-        t = time.perf_counter()
         dense = [r for r in video.records if r.dense_pos >= 0]
         fps_eff = (video.fps or (len(dense) / max(video.duration, 1e-6))) / video.subsample
         phases = max(1, int(round(entry.frame_spacing_s * fps_eff)))
         spacing = phases / fps_eff
-        whole_failure = None
-        try:
-            track, ambiguous = self.faces.track(dense, self.clip_length)
-            clips, segments = phase_clips(
-                track, phases, self.clip_length, int(self.whole["clip_stride_in_phase"]),
-                float(self.whole["max_gap_factor"]) * max(spacing, entry.frame_spacing_s),
-            )
-            if not clips:
-                raise AnalysisFailed("insufficient_valid_frames")
-        except AnalysisFailed as exc:
-            if not protocol["available"]:
-                raise
-            whole_failure = exc.reason  # fall back to the protocol anchors
-            track, ambiguous, segments = selected, 0, 1
-            clips = [[selected[i] for i in a] for a in anchors]
-        timings["tracking"] = time.perf_counter() - t
+        if fcg:
+            scored = self._score_video_fcg(video_path, video, entry, dense, phases, spacing, timings)
+        else:
+            scored = self._score_video_swin(video, entry, dense, phases, spacing, timings)
+        protocol, clips, track, ambiguous = scored["protocol"], scored["clips"], scored["track"], scored["ambiguous"]
+        segments, whole_failure, logits, probs = scored["segments"], scored["fallback"], scored["logits"], scored["probs"]
+        contributions, readout = scored["maps"], scored["readout"]
 
-        t = time.perf_counter()
-        index = torch.tensor([[c.crop_index for c in clip] for clip in clips], device=self.device)
-        logits, contributions = self._score(entry.net, video.crops, index)
-        if self.device.type == "cuda":
-            torch.cuda.synchronize()
-        timings["inference"] = time.perf_counter() - t
-        readout = self._readout(entry, logits)
+        def summary(members: np.ndarray) -> tuple[float, float]:
+            """Log-odds and calibrated probability of a group of clips, read out as the video is."""
+            if probs is None:
+                mean_logit = float(np.mean(logits[members]))
+                return mean_logit, _sigmoid(mean_logit / entry.temperature)
+            mean_logit = _logit(float(np.mean(probs[members])))
+            return mean_logit, _sigmoid(mean_logit / entry.temperature)
 
         # Timeline: average the clips whose centre falls in each window of half a clip.
         starts = np.array([clip[0].record.timestamp for clip in clips])
@@ -999,7 +1173,7 @@ class DetectorService:
         timeline, bucket_to_segment = [], {}
         for b in sorted(set(bucket.tolist())):
             members = np.where(bucket == b)[0]
-            mean_logit = float(np.mean(logits[members]))
+            mean_logit, mean_prob = summary(members)
             bucket_to_segment[b] = len(timeline)
             timeline.append(
                 {
@@ -1007,7 +1181,7 @@ class DetectorService:
                     "start_s": round(origin + b * width, 3),
                     "end_s": round(min(origin + (b + 1) * width, float(ends.max())), 3),
                     "logit": round(mean_logit, 4),
-                    "prob": round(_sigmoid(mean_logit / entry.temperature), 4),
+                    "prob": round(mean_prob, 4),
                     "clips": int(len(members)),
                     "heatmap": False,
                 }
@@ -1041,16 +1215,20 @@ class DetectorService:
             for (clip_i, role), rel in zip(chosen, relative):
                 segment = bucket_to_segment[int(bucket[clip_i])]
                 timeline[segment]["heatmap"] = True
+                shown, shown_crops, shown_mats = self._moment_frames(
+                    video, entry, clips[clip_i], rel.shape[0], scored.get("face_crops"), scored.get("face_rows"),
+                    scored.get("geometry"))
                 rendered.append({
                     "clip_index": segment,
                     "role": role,
                     "clip_start_s": round(float(starts[clip_i]), 3),
                     "clip_end_s": round(float(ends[clip_i]), 3),
                     "clip_prob": round(_sigmoid(float(logits[clip_i]) / entry.temperature), 4),
-                    "frames": self._render(video, clips[clip_i], rel),
+                    "frames": self._render(video, shown, rel, shown_crops, shown_mats),
                 })
             heatmaps = {
-                "method": "Class activation map (final Video Swin stage)",
+                "method": ("Patch contributions to the DFD-FCG heads" if fcg
+                           else "Class activation map (final Video Swin stage)"),
                 "target": readout["pred"],
                 "scale": "relative within this video",
                 "frame_size": list(video.preview_size),
@@ -1068,7 +1246,7 @@ class DetectorService:
             "threshold": entry.threshold,
             "temperature": entry.temperature,
             "threshold_space": "calibrated",
-            "aggregation": "mean_clip_logit",
+            "aggregation": "mean_clip_probability" if fcg else "mean_clip_logit",
             "clips": timeline,
             "protocol": protocol,
             "coverage": {
@@ -1090,7 +1268,7 @@ class DetectorService:
                 "frame_spacing_s": round(spacing, 4),
                 "trained_spacing_s": entry.frame_spacing_s,
                 "clips": len(clips),
-                "clip_length": self.clip_length,
+                "clip_length": entry.clip_length,
                 "segments": segments,
                 "timeline_segments": len(timeline),
                 "analyzed_start_s": round(float(starts.min()), 3) if len(clips) else None,
@@ -1102,9 +1280,74 @@ class DetectorService:
             "timings": {k: round(v, 2) for k, v in timings.items()},
         }
 
+    def _score_video_swin(self, video: DenseVideo, entry: ModelEntry, dense: list[FrameRecord], phases: int,
+                          spacing: float, timings: dict[str, float]) -> dict:
+        """Video Swin: the thesis protocol, then every frame in interleaved phases."""
+        # Thesis protocol: 64 -> track -> 48 -> three anchors.
+        t = time.perf_counter()
+        evidence = self.policy["evidence"]
+        protocol: dict[str, Any] = {"available": False, "clip_count": int(evidence["evaluation_clip_count"])}
+        selected: list[Candidate] = []
+        anchors: list[list[int]] = []
+        try:
+            p_track, _ = self.faces.track(video.protocol_frames, int(evidence["minimum_valid_frames"]))
+            selected = [p_track[i] for i in deterministic_selection_indices(len(p_track), int(evidence["maximum_cached_frames"]))]
+            anchors = evaluation_anchors(len(selected), self.clip_length, int(evidence["evaluation_clip_count"]))
+            if len(anchors) != int(evidence["evaluation_clip_count"]):
+                raise AnalysisFailed("insufficient_valid_clips")
+            index = torch.tensor([[selected[i].crop_index for i in a] for a in anchors], device=self.device)
+            logits, _ = self._score(entry.net, video.crops, index)
+            protocol.update(self._readout(entry, logits))
+            protocol.update(available=True, clip_logits=[float(v) for v in logits], track_frames=len(p_track))
+        except AnalysisFailed as exc:
+            protocol.update(reason=exc.reason, message=str(exc))
+
+        timings["protocol"] = time.perf_counter() - t
+
+        # Every frame: track the face through all analysed frames, split into phases at the
+        # trained spacing, tile each phase into 16-frame clips.
+        t = time.perf_counter()
+        whole_failure = None
+        try:
+            track, ambiguous = self.faces.track(dense, self.clip_length)
+            clips, segments = phase_clips(
+                track, phases, self.clip_length, int(self.whole["clip_stride_in_phase"]),
+                float(self.whole["max_gap_factor"]) * max(spacing, entry.frame_spacing_s),
+            )
+            if not clips:
+                raise AnalysisFailed("insufficient_valid_frames")
+        except AnalysisFailed as exc:
+            if not protocol["available"]:
+                raise
+            whole_failure = exc.reason  # fall back to the protocol anchors
+            track, ambiguous, segments = selected, 0, 1
+            clips = [[selected[i] for i in a] for a in anchors]
+        timings["tracking"] = time.perf_counter() - t
+
+        t = time.perf_counter()
+        index = torch.tensor([[c.crop_index for c in clip] for clip in clips], device=self.device)
+        logits, contributions = self._score(entry.net, video.crops, index)
+        if self.device.type == "cuda":
+            torch.cuda.synchronize()
+        timings["inference"] = time.perf_counter() - t
+        return {
+            "protocol": protocol, "clips": clips, "track": track, "ambiguous": ambiguous, "segments": segments,
+            "fallback": whole_failure, "logits": logits, "probs": None, "maps": contributions,
+            "readout": self._readout(entry, logits),
+        }
+
     def benchmark(self, model_id: str) -> dict:
         """Synthetic scoring pass used by the Vast PyWorker benchmark."""
         entry = self.models[model_id]
+        if entry.arch == "dfd_fcg":
+            size, length = dfd_fcg.CROP_SIZE, entry.clip_length
+            crops = torch.randint(0, 255, (length * 2, size, size, 3), dtype=torch.uint8, device=self.device)
+            t = time.perf_counter()
+            with self._lock:
+                _, logits, _ = self._score_fcg(entry.net, crops, torch.arange(length * 2, device=self.device).view(2, length))
+                if self.device.type == "cuda":
+                    torch.cuda.synchronize()
+            return {"seconds": time.perf_counter() - t, "logits": [float(v) for v in logits]}
         size = self.faces.size
         crops = torch.randint(0, 255, (self.clip_length * 2, size, size, 3), dtype=torch.uint8, device=self.device)
         index = torch.arange(self.clip_length * 2, device=self.device).view(2, self.clip_length)
