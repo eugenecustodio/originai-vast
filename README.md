@@ -157,6 +157,13 @@ the three heads' fake-minus-real logits splits exactly into one value per frame 
 like the Video Swin ones: for the most suspicious clips and the least, relative within the video, on the 224 x 224
 input (the 150 x 150 crop) and on the frame, 10 frames per clip.
 
+**On the GPU** (RTX A4000, image `cu126-65759f2`, the 11 test videos of 12 to 18 s): the authors'-protocol
+scores were within 0.019 of the authors' own pipeline on the CPU (the encoder runs in float16 there, and NVDEC
+decodes slightly differently), and the verdicts agreed. Worker time was 7 to 40 s per video, of which the model
+took 3 to 5 s. Most of the rest was the landmark step, which TorchScript re-optimised for every new batch size;
+since `7a98916` its batches are always 16 faces, so it compiles once at start (on scans that had already
+compiled, it took 1 to 2 s).
+
 **Cost.** The landmark model runs on every face, and the video is decoded twice. The clips of a 2-minute video
 are about 3,600 frames through a ViT-L/14.
 
