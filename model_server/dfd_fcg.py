@@ -399,7 +399,13 @@ class Landmarker:
         for s in range(0, len(keep), chunk):
             crops = self._crops(flat, hs, ws, inds[s : s + chunk], ul_t[s : s + chunk], br_t[s : s + chunk])
             inp = crops.permute(0, 3, 1, 2).div(255.0)
-            heatmaps.append(self.net(inp.half() if self.half else inp).float())
+            # Always ``chunk`` faces per call: TorchScript re-optimises the network for every new input
+            # shape, which made this step take 1 to 30 seconds per video. Each face is independent
+            # (eval mode), so the zero padding changes nothing.
+            count = len(inp)
+            if count < chunk:
+                inp = torch.cat([inp, inp.new_zeros((chunk - count, *inp.shape[1:]))])
+            heatmaps.append(self.net(inp.half() if self.half else inp).float()[:count])
         peaks = self._peaks(torch.cat(heatmaps)).double().cpu().numpy()  # (K, 68, 2) on the 64 x 64 grid
 
         # utils.transform_np(invert=True) from the 64 x 64 grid to the scaled frame, truncated to

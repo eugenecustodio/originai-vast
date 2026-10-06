@@ -960,7 +960,8 @@ class DetectorService:
         for entry in [e for e in self.models.values() if e.arch == "video_swin_b"][:1]:
             self._score(entry.net, crops, index)
         for entry in [e for e in self.models.values() if e.arch == "dfd_fcg"][:1]:
-            self.faces.landmarker(frames, [0, 1], np.array([[200.0, 80.0, 440.0, 320.0]] * 2))
+            for _ in range(3):  # TorchScript profiles a shape on its first runs and optimises after
+                self.faces.landmarker(frames, [0, 1], np.array([[200.0, 80.0, 440.0, 320.0]] * 2))
             faces = torch.randint(0, 255, (entry.clip_length, dfd_fcg.CROP_SIZE, dfd_fcg.CROP_SIZE, 3), dtype=torch.uint8, device=self.device)
             self._score_fcg(entry.net, faces, torch.arange(entry.clip_length, device=self.device)[None])
         _jpegs(crops[:1].permute(0, 3, 1, 2), 80)
