@@ -134,15 +134,15 @@ authors' checkpoint with every weight accounted for):
 | Input | 224 x 224 bicubic with antialiasing, CLIP normalisation | The same (`prepare_frames`) |
 
 **Checked against the authors' code** (their preprocessing and model classes, run unmodified on the CPU, on the
-two videos in their repository and this project's sample clips):
+two videos in their repository and this project's nine sample clips: 480p to 1080p, 24 to 30 fps):
 
 - Model: a clip gets the same probability from both implementations to 7 decimal places.
-- Crop code: given the authors' landmarks, every crop is pixel-identical to theirs (1,619 of 1,619 frames in
-  4 videos), and the GPU warp equals `cv2.warpAffine` for faces that leave the frame.
-- Whole pipeline: landmarks differ by 0.7 to 1.1 px on average (the face boxes differ slightly), which moves a
-  crop by up to a pixel in about a tenth of the frames. Under the authors' evaluation protocol the video scores
-  were 0.371 vs 0.374 (their `000.mp4`, real), 0.928 vs 0.934 (`000_003.mp4`, fake; their demo shows 0.94),
-  0.661 vs 0.651 (Celeb-DF `id0_id9_0005`) and 0.490 vs 0.474 (DeeperForensics `054_M117`).
+- Crop code: given the authors' landmarks, every crop is pixel-identical to theirs (4,482 of 4,482 frames in the
+  11 videos), and the GPU warp equals `cv2.warpAffine` for faces that leave the frame.
+- Whole pipeline: landmarks differ by 0.7 to 1.3 px on average (1.5 to 1.8% of the eye distance; the face boxes
+  differ slightly), which moves a crop by a pixel in a tenth to a quarter of the frames. Under the authors'
+  evaluation protocol the video scores differed by 0.0006 to 0.017 (median 0.004); for example 0.371 vs 0.374
+  for their `000.mp4` (real) and 0.928 vs 0.934 for `000_003.mp4` (fake; their demo shows 0.94).
 
 **Every frame.** As for the other detectors, the tracked frames are split into k = round(0.33 x fps) interleaved
 phases and each phase is tiled into 10-frame clips (the trained spacing: 10 frames over 3 seconds), so every
