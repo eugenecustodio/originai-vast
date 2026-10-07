@@ -37,7 +37,7 @@ WEIGHTS_DIR = Path(os.environ.get("ORIGINAI_WEIGHTS_DIR", APP_DIR / "weights"))
 DEVICE = os.environ.get("ORIGINAI_DEVICE", "auto")
 # Optional comma-separated subset of model ids to load (e.g. on a low-memory test machine).
 ONLY_MODELS = [m.strip() for m in os.environ.get("ORIGINAI_MODELS", "").split(",") if m.strip()] or None
-MAX_VIDEO_BYTES = int(os.environ.get("ORIGINAI_MAX_VIDEO_MB", "150")) * 1024 * 1024
+MAX_VIDEO_BYTES = int(os.environ.get("ORIGINAI_MAX_VIDEO_MB", "250")) * 1024 * 1024
 ALLOWED_EXTS = {".mp4", ".mov", ".webm", ".mkv"}
 
 app = FastAPI(title="OriginAI model server")
