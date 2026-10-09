@@ -36,11 +36,15 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import gc
 import json
+import logging
 import math
+import os
 import queue
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -55,6 +59,8 @@ from torchvision.models.video import swin3d_b
 import dfd_fcg
 from gpu_mtcnn import detect_faces
 from video_io import nvdec_diagnostics, open_source
+
+log = logging.getLogger("originai.detector")
 
 FAILURE_MESSAGES = {
     "metadata_error": "The video's duration could not be read.",
@@ -74,6 +80,326 @@ class AnalysisFailed(Exception):
     def __init__(self, reason: str) -> None:
         super().__init__(FAILURE_MESSAGES.get(reason, reason))
         self.reason = reason
+
+
+def _is_oom(exc: BaseException) -> bool:
+    """CUDA out of memory, including the cuBLAS/cuDNN allocation failures raised as RuntimeError."""
+    if isinstance(exc, torch.cuda.OutOfMemoryError):
+        return True
+    return isinstance(exc, RuntimeError) and ("out of memory" in str(exc) or "ALLOC_FAILED" in str(exc))
+
+
+# ---------------------------------------------------------------------------
+# Running several scans on one GPU
+# ---------------------------------------------------------------------------
+# One scan keeps the GPU busy only part of the time: much of it is decoding, face tracking and
+# waiting on small GPU steps. Scans therefore run side by side in threads (ScanGate), so one
+# scan's GPU work fills the gaps in another's. Measured on an RTX 5090 with 12 CPU cores (mixed
+# workload, scans/min): 1 at a time 4.4, 2 at once 7.4, 3 at once 8.7, 4 at once 8.0 (the CPU, which
+# decodes the videos, was then the limit). With 3 at once and the heaviest videos the GPU peaked
+# at 24 GB: the models take ~3.7 GB, and each scan about 6.7 GB including its share of the model pass.
+GPU_RESERVE_GB = 6.0  # models, CUDA context and allocator slack
+GPU_GB_PER_SCAN = 7.5
+CPU_CORES_PER_SCAN = 3.5  # decoding and the Python side of face detection and tracking
+HOST_RESERVE_GB = 6.0
+HOST_GB_PER_SCAN = 3.5  # frame previews of a 2-minute 60 fps video, decoder buffers
+MAX_SLOTS = 4
+
+
+def _host_available_gb() -> float:
+    """Memory this container can still use (MemAvailable, capped by its cgroup limit)."""
+    try:
+        with open("/proc/meminfo") as f:
+            available = next(int(line.split()[1]) for line in f if line.startswith("MemAvailable")) / 2**20
+    except (OSError, StopIteration, ValueError):
+        return float("inf")
+    for limit_file, usage_file in (("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory.current"),
+                                   ("/sys/fs/cgroup/memory/memory.limit_in_bytes", "/sys/fs/cgroup/memory/memory.usage_in_bytes")):
+        try:
+            with open(limit_file) as f:
+                limit = f.read().strip()
+            if limit != "max" and int(limit) < 1 << 50:
+                with open(usage_file) as f:
+                    available = min(available, (int(limit) - int(f.read())) / 2**30)
+            break
+        except (OSError, ValueError):
+            continue
+    return available
+
+
+def _cpu_cores() -> float:
+    """CPU cores this container may use (its cgroup quota, else the cores it may run on)."""
+    for quota_file, period_file in (("/sys/fs/cgroup/cpu.max", None),
+                                    ("/sys/fs/cgroup/cpu/cpu.cfs_quota_us", "/sys/fs/cgroup/cpu/cpu.cfs_period_us")):
+        try:
+            with open(quota_file) as f:
+                fields = f.read().split()
+            if period_file is None:
+                if fields[0] != "max":
+                    return int(fields[0]) / int(fields[1])
+            elif int(fields[0]) > 0:
+                with open(period_file) as f:
+                    return int(fields[0]) / int(f.read())
+        except (OSError, ValueError, IndexError):
+            continue
+    return float(len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 1))
+
+
+def scan_slots(device: torch.device) -> int:
+    """How many scans run at once: ORIGINAI_CONCURRENCY, or what GPU memory, CPU cores and host
+    memory allow (3 on an RTX 5090 with 12 or more cores, 2 on a 24 GB card, 1 on a 16 GB card)."""
+    configured = int(os.environ.get("ORIGINAI_CONCURRENCY", "0") or 0)
+    if configured > 0:
+        return configured
+    if device.type != "cuda":
+        return 1
+    gpu_gb = torch.cuda.get_device_properties(device).total_memory / 2**30
+    by_gpu = int((gpu_gb - GPU_RESERVE_GB) // GPU_GB_PER_SCAN)
+    by_cpu = int(_cpu_cores() // CPU_CORES_PER_SCAN)
+    by_host = int((_host_available_gb() - HOST_RESERVE_GB) // HOST_GB_PER_SCAN)
+    return max(1, min(MAX_SLOTS, by_gpu, by_cpu, by_host))
+
+
+class ScanGate:
+    """Admits up to ``slots`` scans at once, first come first served, each on its own CUDA stream.
+
+    Per-scan streams keep scans out of each other's waits. Everything a scan puts on the GPU must
+    then be ordered against its stream, which is why videos are decoded on the CPU and uploaded on
+    that stream (``gpu_decode`` false in models.json): torchcodec's GPU decoder, and the CPU
+    fallback inside it, order their uploads only against the default stream, and with per-scan
+    streams that made results vary and, with several scans, broke the GPU context. The JPEG
+    encoder gets the same treatment in ``_jpegs``; the model pass runs on a shared stream of its
+    own (``DetectorService._model_pass``).
+
+    ``exclusive`` admits a scan on its own: it goes to the front of the queue and waits for the
+    running scans to finish. A scan that ran out of GPU memory next to others is re-run this way,
+    so running scans side by side never makes a scan fail."""
+
+    def __init__(self, slots: int, device: torch.device) -> None:
+        self.slots = max(1, int(slots))
+        self.device = device
+        self._cond = threading.Condition()
+        self._queue: deque = deque()
+        self._running = 0
+        self._exclusive = False
+        # High priority: a scan's many small steps (face detection, alignment) start as soon as SMs
+        # free up instead of queueing behind another scan's long model-pass kernels.
+        self._streams = ([torch.cuda.Stream(device, priority=-1) for _ in range(self.slots)]
+                         if device.type == "cuda" else [])
+
+    def status(self) -> dict:
+        with self._cond:
+            return {"slots": self.slots, "running": self._running, "waiting": len(self._queue)}
+
+    @contextlib.contextmanager
+    def slot(self, exclusive: bool = False):
+        ticket = object()
+        with self._cond:
+            (self._queue.appendleft if exclusive else self._queue.append)(ticket)
+
+            def admitted() -> bool:
+                if self._queue[0] is not ticket:
+                    return False
+                return self._running == 0 if exclusive else self._running < self.slots and not self._exclusive
+
+            self._cond.wait_for(admitted)
+            self._queue.popleft()
+            self._running += 1
+            self._exclusive = self._exclusive or exclusive
+            stream = self._streams.pop() if self._streams else None
+            self._cond.notify_all()
+        try:
+            with torch.cuda.stream(stream) if stream is not None else contextlib.nullcontext():
+                yield
+        finally:
+            if stream is not None:
+                stream.synchronize()
+            with self._cond:
+                if stream is not None:
+                    self._streams.append(stream)
+                self._running -= 1
+                if exclusive:
+                    self._exclusive = False
+                idle = self._running == 0
+                self._cond.notify_all()
+            if idle and self.device.type == "cuda":
+                torch.cuda.empty_cache()  # give memory back only when no scan is running
+
+
+class _LandmarkQueue:
+    """Collects 2D-FAN inputs over frame batches and runs the network on full chunks only.
+
+    The network always takes ``CHUNK`` (16) faces; a 1080p frame batch holds 19 frames, so calling
+    it per batch padded 3 faces up to 16 every time and wasted ~40% of the work. Each face goes
+    through the same 16-face call either way, so its landmarks are the same."""
+
+    def __init__(self, landmarker: dfd_fcg.Landmarker) -> None:
+        self.landmarker = landmarker
+        self.resolved_upto = -1  # every face in frames up to this index has its landmarks (or none)
+        self._inputs: list[torch.Tensor] = []  # waiting network inputs, in face order
+        self._waiting = 0
+        self._peaks: list[torch.Tensor] = []  # computed peaks not yet handed out
+        self._ready = 0
+        self._batches: deque = deque()  # (geometry, candidates, kept faces, last frame) per frame batch, in order
+
+    def add(self, inputs: torch.Tensor, geometry: dict, candidates: list["Candidate"], last_frame: int) -> None:
+        """One frame batch's faces (possibly none), ``last_frame`` being the batch's last frame index."""
+        self._batches.append((geometry, candidates, len(inputs), last_frame))
+        if len(inputs):
+            self._inputs.append(inputs)
+            self._waiting += len(inputs)
+        self._run(self._waiting - self._waiting % self.landmarker.CHUNK)
+
+    def finish(self) -> None:
+        self._run(self._waiting)
+
+    @torch.inference_mode()
+    def _run(self, take: int) -> None:
+        if take:
+            waiting = torch.cat(self._inputs) if len(self._inputs) > 1 else self._inputs[0]
+            self._peaks.append(self.landmarker.run(waiting[:take]))
+            rest = waiting[take:]
+            self._inputs, self._waiting = ([rest] if len(rest) else []), len(rest)
+            self._ready += take
+        while self._batches and self._batches[0][2] <= self._ready:
+            geometry, candidates, kept, last_frame = self._batches.popleft()
+            peaks = torch.cat(self._peaks) if len(self._peaks) > 1 else (self._peaks[0] if self._peaks else None)
+            points = self.landmarker.points(peaks[:kept] if kept else np.zeros((0, 68, 2)), geometry)
+            self._peaks = [peaks[kept:]] if peaks is not None and len(peaks) > kept else []
+            self._ready -= kept
+            for candidate, face in zip(candidates, points):
+                if np.isfinite(face).all():
+                    object.__setattr__(candidate, "points68", face)  # set once, before anything reads it
+            self.resolved_upto = last_frame
+
+
+class _CanvasCrops:
+    """DFD-FCG's face crops, cut during the one decoding pass.
+
+    Each tracked face is cut from its full-resolution frame with a transform that needs the
+    landmarks of the tracked faces up to 6 frames later, which used to take a second pass over
+    the video. The tracker only looks back, so its choice for a frame is final once the frame is
+    read; a crop is cut as soon as the frames 6 ahead are tracked and their landmarks are in,
+    from the few recent frame batches kept on the GPU. Same tracker, same transforms, same pixels
+    (decoding is deterministic): the crops equal those of the second pass."""
+
+    def __init__(self, policy: dict[str, Any], landmarks: _LandmarkQueue) -> None:
+        self.tracker = IdentityTracker(policy)
+        self.landmarks = landmarks
+        self.last_frame = -1
+        self.kept: list[tuple[Candidate, tuple[np.ndarray, int, int]]] = []  # in frame order
+        self.crops: torch.Tensor | None = None  # (len(kept), 150, 150, 3) uint8 once finished
+        self._parts: list[torch.Tensor] = []
+        self._unresolved: deque = deque()  # tracked faces whose landmarks are not in yet
+        self._frames = np.empty(256, dtype=np.int64)  # tracked faces with landmarks: frame index ...
+        self._points = np.empty((256, 68, 2), dtype=np.float32)  # ... and landmarks, in frame order
+        self._faces: list[Candidate] = []
+        self._next = 0  # first of those without a crop transform yet
+        self._pixels: dict[int, tuple[torch.Tensor, int, int, int]] = {}  # frame index -> (batch, position, h, w)
+
+    def add_batch(self, records: list[FrameRecord], flat: torch.Tensor | None, height: int, width: int) -> None:
+        """One frame batch after detection; ``flat`` is the batch as (B, H*W, 3) (None if it has no faces)."""
+        for position, record in enumerate(records):
+            self.last_frame = max(self.last_frame, record.frame_index)
+            if record.dense_pos < 0:
+                continue  # protocol-only frames are not tracked
+            selected = self.tracker.step(record.candidates)
+            if selected is not None:
+                self._unresolved.append(selected)
+                self._pixels[record.frame_index] = (flat, position, height, width)
+        self._advance(None)
+
+    @torch.inference_mode()
+    def finish(self, total_frames: int) -> None:
+        self._advance(total_frames)
+        self._pixels.clear()
+        self.crops = (torch.cat(self._parts) if self._parts else None)
+        self._parts = []
+
+    @torch.inference_mode()
+    def _advance(self, total_frames: int | None) -> None:
+        final = total_frames is not None
+        resolved = math.inf if final else self.landmarks.resolved_upto
+        while self._unresolved and self._unresolved[0].record.frame_index <= resolved:
+            face = self._unresolved.popleft()
+            if face.points68 is not None:
+                n = len(self._faces)
+                if n == len(self._frames):
+                    self._frames = np.concatenate([self._frames, np.empty_like(self._frames)])
+                    self._points = np.concatenate([self._points, np.empty_like(self._points)])
+                self._frames[n], self._points[n] = face.record.frame_index, face.points68
+                self._faces.append(face)
+        # Every face up to ``horizon`` is tracked and has its landmarks; a transform reads 6 frames ahead.
+        horizon = math.inf if final else min(self.last_frame, self.landmarks.resolved_upto)
+        total = total_frames if final else self.last_frame + 1  # only frames >= 6 from the end are done early
+        n = len(self._faces)
+        ready = []
+        while self._next < n and self._frames[self._next] + dfd_fcg.SMOOTH_WINDOW // 2 <= horizon:
+            geometry = dfd_fcg.frame_crop_geometry(self._points[:n], self._frames[:n], self._next, total)
+            if geometry is not None:
+                ready.append((self._faces[self._next], geometry))
+            self._next += 1
+        groups: dict[int, list] = {}
+        for face, geometry in ready:
+            groups.setdefault(id(self._pixels[face.record.frame_index][0]), []).append((face, geometry))
+        for members in groups.values():
+            flat, _, height, width = self._pixels[members[0][0].record.frame_index]
+            positions = torch.tensor([self._pixels[f.record.frame_index][1] for f, _ in members], device=flat.device)
+            self._parts.append(warp_faces(flat, height, width, positions, np.stack([g[0] for _, g in members]),
+                                          dfd_fcg.CROP_SIZE, offsets=np.array([g[1:] for _, g in members]), zero_border=True))
+            self.kept.extend(members)
+        # Keep only the frames a later crop can still need.
+        oldest = min(self._unresolved[0].record.frame_index if self._unresolved else math.inf,
+                     self._frames[self._next] if self._next < n else math.inf)
+        for frame in [f for f in self._pixels if f < oldest]:
+            del self._pixels[frame]
+
+
+class _Prefetcher:
+    """Decodes batches in a background thread while the caller's GPU work runs.
+
+    The thread queues its work (host-to-GPU copies, rotation) on the caller's CUDA stream, so the
+    caller's later steps on that stream see finished frames."""
+
+    def __init__(self, source, batch_size: int, stream: torch.cuda.Stream | None, depth: int = 3) -> None:
+        self.wait = 0.0
+        self._queue: queue.Queue = queue.Queue(maxsize=depth)
+        self._stop = threading.Event()
+
+        def produce() -> None:
+            try:
+                with torch.cuda.stream(stream) if stream is not None else contextlib.nullcontext():
+                    for item in source.batches(batch_size):
+                        if self._stop.is_set():
+                            return
+                        self._queue.put(item)
+            except Exception as exc:  # surfaced in the consumer
+                self._queue.put(exc)
+            finally:
+                self._queue.put(None)
+
+        self._thread = threading.Thread(target=produce, name="decode", daemon=True)
+        self._thread.start()
+
+    def __iter__(self):
+        while True:
+            started = time.perf_counter()
+            item = self._queue.get()
+            self.wait += time.perf_counter() - started
+            if item is None:
+                return
+            if isinstance(item, Exception):
+                raise item
+            yield item
+
+    def close(self) -> None:
+        """Stop the thread and drain the queue so it never blocks holding frames."""
+        self._stop.set()
+        while self._thread.is_alive():
+            try:
+                self._queue.get(timeout=0.2)
+            except queue.Empty:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -269,58 +595,75 @@ def cosine_distance(left: np.ndarray, right: np.ndarray) -> float:
     return float(1.0 - np.dot(left, right) / (left_norm * right_norm))
 
 
-def track_candidates(candidates_by_frame: list[list[Candidate]], policy: dict[str, Any]) -> TrackResult:
-    settings = policy["tracking"]
-    maximum_distance = float(settings["maximum_cosine_distance"])
-    minimum_iou = float(settings["minimum_iou_for_spatial_fallback"])
-    ambiguity_margin = float(settings["ambiguity_margin"])
-    ema_weight = float(settings["embedding_ema"])
-    track: list[Candidate] = []
-    association_costs: list[float] = []
-    reference_embedding: np.ndarray | None = None
-    previous_box: tuple[float, float, float, float] | None = None
-    ambiguous = 0
-    for candidates in candidates_by_frame:
+class IdentityTracker:
+    """The thesis tracker, one frame at a time. It only looks back, so its choice for a frame is
+    final as soon as that frame's candidates are known (DFD-FCG crops rely on this)."""
+
+    def __init__(self, policy: dict[str, Any]) -> None:
+        settings = policy["tracking"]
+        self.maximum_distance = float(settings["maximum_cosine_distance"])
+        self.minimum_iou = float(settings["minimum_iou_for_spatial_fallback"])
+        self.ambiguity_margin = float(settings["ambiguity_margin"])
+        self.ema_weight = float(settings["embedding_ema"])
+        self.track: list[Candidate] = []
+        self.association_costs: list[float] = []
+        self.reference_embedding: np.ndarray | None = None
+        self.previous_box: tuple[float, float, float, float] | None = None
+        self.ambiguous = 0
+        self.frames = 0
+
+    def step(self, candidates: list[Candidate]) -> Candidate | None:
+        """The next frame's candidates -> the tracked face in it, or None."""
+        self.frames += 1
         if not candidates:
-            continue
-        if reference_embedding is None:
+            return None
+        if self.reference_embedding is None:
             selected = max(candidates, key=lambda item: item.probability)
             selected_cost = 0.0
         else:
             scored = []
             for candidate in candidates:
-                distance = cosine_distance(reference_embedding, candidate.embedding)
-                iou = box_iou(previous_box, candidate.box) if previous_box else 0.0
-                if distance <= maximum_distance or iou >= minimum_iou:
+                distance = cosine_distance(self.reference_embedding, candidate.embedding)
+                iou = box_iou(self.previous_box, candidate.box) if self.previous_box else 0.0
+                if distance <= self.maximum_distance or iou >= self.minimum_iou:
                     scored.append((distance + 0.15 * (1.0 - iou), distance, candidate))
             scored.sort(key=lambda item: (item[0], -item[2].probability))
             if not scored:
-                continue
-            if len(scored) > 1 and scored[1][0] - scored[0][0] < ambiguity_margin:
-                ambiguous += 1
-                continue
-            if scored[0][1] > maximum_distance and box_iou(previous_box, scored[0][2].box) < minimum_iou:
-                continue
+                return None
+            if len(scored) > 1 and scored[1][0] - scored[0][0] < self.ambiguity_margin:
+                self.ambiguous += 1
+                return None
+            if scored[0][1] > self.maximum_distance and box_iou(self.previous_box, scored[0][2].box) < self.minimum_iou:
+                return None
             selected = scored[0][2]
             selected_cost = float(scored[0][0])
-        track.append(selected)
-        association_costs.append(selected_cost)
-        if reference_embedding is None:
-            reference_embedding = selected.embedding.astype(np.float32, copy=True)
+        self.track.append(selected)
+        self.association_costs.append(selected_cost)
+        if self.reference_embedding is None:
+            self.reference_embedding = selected.embedding.astype(np.float32, copy=True)
         else:
-            reference_embedding = ema_weight * reference_embedding + (1.0 - ema_weight) * selected.embedding
-            norm = np.linalg.norm(reference_embedding)
+            self.reference_embedding = self.ema_weight * self.reference_embedding + (1.0 - self.ema_weight) * selected.embedding
+            norm = np.linalg.norm(self.reference_embedding)
             if norm:
-                reference_embedding /= norm
-        previous_box = selected.box
-    gaps = len(candidates_by_frame) - len(track)
-    return TrackResult(
-        candidates=track,
-        association_costs=association_costs,
-        ambiguous_frames=ambiguous,
-        gap_frames=gaps,
-        termination_reason=("completed_candidate_sequence" if track else "no_primary_identity_initialized"),
-    )
+                self.reference_embedding /= norm
+        self.previous_box = selected.box
+        return selected
+
+    def result(self) -> TrackResult:
+        return TrackResult(
+            candidates=self.track,
+            association_costs=self.association_costs,
+            ambiguous_frames=self.ambiguous,
+            gap_frames=self.frames - len(self.track),
+            termination_reason=("completed_candidate_sequence" if self.track else "no_primary_identity_initialized"),
+        )
+
+
+def track_candidates(candidates_by_frame: list[list[Candidate]], policy: dict[str, Any]) -> TrackResult:
+    tracker = IdentityTracker(policy)
+    for candidates in candidates_by_frame:
+        tracker.step(candidates)
+    return tracker.result()
 
 
 def deterministic_selection_indices(length: int, maximum: int) -> list[int]:
@@ -474,7 +817,17 @@ def _b64(data: bytes) -> str:
 
 def _jpegs(images: torch.Tensor, quality: int) -> list[bytes]:
     """(N, 3, H, W) uint8 -> JPEG bytes (nvJPEG on CUDA, libjpeg on CPU)."""
-    encoded = encode_jpeg([img.contiguous() for img in images], quality=quality)
+    images = [img.contiguous() for img in images]
+    if not images or not images[0].is_cuda:
+        return [e.numpy().tobytes() for e in encode_jpeg(images, quality=quality)]
+    # torchvision's GPU encoder is tied to the stream that was current when it was first created
+    # (the default stream, at warm-up): it waits only for that stream before reading the images,
+    # and signals only that stream when the JPEG bytes are written. Scans run on their own
+    # streams (ScanGate), so finish this scan's stream first and the default stream after.
+    device = images[0].device
+    torch.cuda.current_stream(device).synchronize()
+    encoded = encode_jpeg(images, quality=quality)
+    torch.cuda.default_stream(device).synchronize()
     return [e.cpu().numpy().tobytes() for e in encoded]
 
 
@@ -494,10 +847,11 @@ class DenseVideo:
     records: list[FrameRecord]
     protocol_frames: list[FrameRecord]
     crops: torch.Tensor  # (N, 224, 224, 3) uint8 on the compute device
-    previews: torch.Tensor  # (M, 3, ph, pw) uint8 on the compute device
+    previews: torch.Tensor  # (M, 3, ph, pw) uint8 in host memory (only the frames shown go back to the GPU)
     preview_size: tuple[int, int]
     preview_scale: float
     timings: dict[str, float]
+    canvas: "_CanvasCrops | None" = None  # DFD-FCG: the tracked faces' crops, cut during the pass
 
 
 class FacePipeline:
@@ -544,8 +898,11 @@ class FacePipeline:
 
     def _sync(self) -> float:
         if self.device.type == "cuda":
-            torch.cuda.synchronize(self.device)
+            torch.cuda.current_stream(self.device).synchronize()  # this scan's stream, not the whole GPU
         return time.perf_counter()
+
+    def _stream(self) -> torch.cuda.Stream | None:
+        return torch.cuda.current_stream(self.device) if self.device.type == "cuda" else None
 
     @torch.inference_mode()
     def _process_batch(self, frames: torch.Tensor, records: list[FrameRecord], state: dict) -> None:
@@ -570,34 +927,41 @@ class FacePipeline:
                 mats.append(matrix)
                 meta.append((record, tuple(map(float, box)), float(prob), pts))
         landmark_time = 0.0
+        flat, created = None, []
         if mats:
             flat = frames.permute(0, 2, 3, 1).reshape(len(frames), height * width, 3)
             crops = warp_faces(flat, height, width, torch.tensor(inds, device=frames.device), np.stack(mats), self.size)
-            del flat
+            if state["canvas"] is None:
+                flat = None  # only DFD-FCG cuts crops from the frames later
             embeddings = self._embed(crops)
-            points68 = None
-            if state["landmarks"]:
-                started = self._sync()
-                points68 = self.landmarker(frames, inds, dfd_fcg.sfd_boxes(np.array([m[1] for m in meta])))
-                landmark_time = self._sync() - started
-                timing["landmarks"] += landmark_time
             base = state["crop_count"]
             state["crops"].append(crops)
             state["crop_count"] += len(crops)
             for k, ((record, box, prob, pts), matrix, embedding) in enumerate(zip(meta, mats, embeddings)):
-                record.candidates.append(
-                    Candidate(
-                        frame_position=record.frame_index,
-                        box=box,
-                        probability=prob,
-                        landmarks=tuple(tuple(map(float, p)) for p in pts),
-                        crop_index=base + k,
-                        embedding=embedding,
-                        matrix=matrix,
-                        record=record,
-                        points68=points68[k] if points68 is not None and np.isfinite(points68[k]).all() else None,
-                    )
+                candidate = Candidate(
+                    frame_position=record.frame_index,
+                    box=box,
+                    probability=prob,
+                    landmarks=tuple(tuple(map(float, p)) for p in pts),
+                    crop_index=base + k,
+                    embedding=embedding,
+                    matrix=matrix,
+                    record=record,
                 )
+                record.candidates.append(candidate)
+                created.append(candidate)
+        if state["fan"] is not None:  # DFD-FCG: 2D-FAN landmarks (filled in as full chunks run), then crops
+            started = self._sync()
+            boxes = dfd_fcg.sfd_boxes(np.array([m[1] for m in meta])) if meta else np.zeros((0, 4))
+            inputs, geometry = self.landmarker.inputs(frames, inds, boxes)
+            state["fan"].add(inputs, geometry, created, records[-1].frame_index)
+            landmark_time = self._sync() - started
+            timing["landmarks"] += landmark_time
+            started = self._sync()
+            state["canvas"].add_batch(records, flat, height, width)
+            canvas_time = self._sync() - started
+            timing["canvas"] += canvas_time
+            landmark_time += canvas_time
         t2 = self._sync()
         timing["align_embed"] += t2 - t1 - landmark_time
         pw, ph = state["preview_size"]
@@ -608,7 +972,7 @@ class FacePipeline:
             grown = torch.empty((max(2 * len(store), count + len(previews)), *store.shape[1:]), dtype=store.dtype, device=store.device)
             grown[:count] = store[:count]
             state["previews"] = store = grown
-        store[count : count + len(previews)] = previews  # preallocated: no per-batch copies
+        store[count : count + len(previews)].copy_(previews)  # preallocated host store: no per-batch allocations
         for record in records:
             record.preview_index = state["preview_count"]
             state["preview_count"] += 1
@@ -622,7 +986,9 @@ class FacePipeline:
             source, info = open_source(path, self.device, prefer_gpu=bool(cfg.get("gpu_decode", True)))
         except ValueError as exc:
             raise AnalysisFailed(str(exc) if str(exc) in FAILURE_MESSAGES else "decode_failed")
-        except Exception:
+        except Exception as exc:
+            if _is_oom(exc):
+                raise
             raise AnalysisFailed("decode_failed")
         if info.duration <= 0:
             raise AnalysisFailed("metadata_error")
@@ -642,11 +1008,15 @@ class FacePipeline:
         state = {
             "timing": {"decode_wait": 0.0, "detect": 0.0, "align_embed": 0.0, "previews": 0.0},
             "crops": [], "crop_count": 0, "preview_count": 0, "preview_size": (pw, ph),
-            "previews": torch.empty((capacity, 3, ph, pw), dtype=torch.uint8, device=self.device),
-            "landmarks": landmarks and self.landmarker is not None,
+            # Host memory: only the few frames shown with the evidence maps go back to the GPU,
+            # so a long video does not hold up to ~3 GB of GPU memory next to other scans.
+            "previews": torch.empty((capacity, 3, ph, pw), dtype=torch.uint8),
+            "fan": _LandmarkQueue(self.landmarker) if landmarks and self.landmarker is not None else None,
         }
-        if state["landmarks"]:
+        state["canvas"] = _CanvasCrops(self.policy, state["fan"]) if state["fan"] is not None else None
+        if state["fan"] is not None:
             state["timing"]["landmarks"] = 0.0
+            state["timing"]["canvas"] = 0.0
         records: list[FrameRecord] = []
         pending: list[torch.Tensor] = []
         pending_records: list[FrameRecord] = []
@@ -661,34 +1031,9 @@ class FacePipeline:
                 pending_records.clear()
 
         # Decode the next batches in a background thread while the GPU works on this one.
-        batches: queue.Queue = queue.Queue(maxsize=3)
-        stop = threading.Event()
-
-        def produce() -> None:
-            try:
-                for item in source.batches(batch_size):
-                    if stop.is_set():
-                        return
-                    batches.put(item)
-            except Exception as exc:  # surfaced in the consumer below
-                batches.put(exc)
-            finally:
-                batches.put(None)
-
-        producer = threading.Thread(target=produce, name="decode", daemon=True)
-        producer.start()
-
-        def next_batch():
-            started = time.perf_counter()
-            item = batches.get()
-            state["timing"]["decode_wait"] += time.perf_counter() - started
-            if isinstance(item, Exception):
-                raise item
-            return item
-
+        prefetch = _Prefetcher(source, batch_size, self._stream())
         try:
-            while (item := next_batch()) is not None:
-                data, pts, idx = item
+            for data, pts, idx in prefetch:
                 for j in range(len(pts)):
                     decoded += 1
                     t, index = float(pts[j]), int(idx[j])
@@ -716,20 +1061,24 @@ class FacePipeline:
             flush()
         except AnalysisFailed:
             raise
-        except Exception:
+        except Exception as exc:
+            if _is_oom(exc):
+                raise  # not a decoding problem: the scan is re-run (see DetectorService.analyze)
             if not records:
                 raise AnalysisFailed("decode_failed")
             flush()
         finally:
-            # Stop the decoder thread and drain the queue so it never blocks holding frames.
-            stop.set()
-            while producer.is_alive():
-                try:
-                    batches.get(timeout=0.2)
-                except queue.Empty:
-                    pass
+            prefetch.close()
+            state["timing"]["decode_wait"] = prefetch.wait
         if not records:
             raise AnalysisFailed("decode_failed")
+        if state["fan"] is not None:  # the last, partial chunk of landmark inputs, then the last crops
+            started = self._sync()
+            state["fan"].finish()
+            middle = self._sync()
+            state["canvas"].finish(decoded)
+            state["timing"]["landmarks"] += middle - started
+            state["timing"]["canvas"] += self._sync() - middle
 
         crops = torch.cat(state["crops"]) if state["crops"] else torch.empty(0, self.size, self.size, 3, dtype=torch.uint8, device=self.device)
         previews = state["previews"][: state["preview_count"]]
@@ -749,17 +1098,20 @@ class FacePipeline:
             preview_size=(pw, ph),
             preview_scale=preview_scale,
             timings=dict(state["timing"]),
+            canvas=state["canvas"],
         )
 
-    def track(self, frames: list[FrameRecord], minimum: int) -> tuple[list[Candidate], int]:
-        """Track the primary identity; raise AnalysisFailed with the training reason codes."""
+    def track(self, frames: list[FrameRecord], minimum: int, result: TrackResult | None = None) -> tuple[list[Candidate], int]:
+        """Track the primary identity; raise AnalysisFailed with the training reason codes.
+        ``result``: the tracker already ran over ``frames`` (DFD-FCG tracks during the pass)."""
         if not frames:
             raise AnalysisFailed("decode_failed")
         if not any(record.detected for record in frames):
             raise AnalysisFailed("no_face")
         if not any(record.candidates for record in frames):
             raise AnalysisFailed("low_detection_confidence")
-        result = track_candidates([record.candidates for record in frames], self.policy)
+        if result is None:
+            result = track_candidates([record.candidates for record in frames], self.policy)
         if not result.candidates:
             raise AnalysisFailed("identity_track_failed")
         if len(result.candidates) < minimum:
@@ -770,43 +1122,6 @@ class FacePipeline:
                 else "insufficient_valid_frames"
             )
         return result.candidates, result.ambiguous_frames
-
-    @torch.inference_mode()
-    def canvas_crops(self, path: Path, faces: list[Candidate], geometry: list[tuple[np.ndarray, int, int]],
-                     size: int) -> tuple[torch.Tensor, np.ndarray]:
-        """Read the video a second time and cut each tracked face's crop straight from its
-        full-resolution frame: ``cv2.warpAffine(frame, matrix, canvas)[top : top + size, left : left + size]``
-        with a black border, for ``geometry[i] = (matrix, left, top)``.
-
-        The crops depend on landmarks from the frames around each one and on which face the
-        tracker settles on, both only known once the whole video has been read; warping the
-        original frame once (instead of re-sampling a stored crop) keeps the pixels the model
-        sees the same as in its training data.
-
-        Returns the crops (len(faces), size, size, 3) uint8 on the compute device and which of
-        them could be read."""
-        rows = {c.record.frame_index: row for row, c in enumerate(faces)}
-        crops = torch.zeros((len(faces), size, size, 3), dtype=torch.uint8, device=self.device)
-        done = np.zeros(len(faces), dtype=bool)
-        try:
-            source, info = open_source(path, self.device, prefer_gpu=bool(self.cfg.get("gpu_decode", True)))
-            for data, _, idx in source.batches(self._detection_batch(info.height, info.width)):
-                wanted = [(position, rows[int(i)]) for position, i in enumerate(idx) if int(i) in rows]
-                if not wanted:
-                    continue
-                height, width = data.shape[2:]
-                flat = data.permute(0, 2, 3, 1).reshape(len(data), height * width, 3)
-                target = [row for _, row in wanted]
-                crops[torch.tensor(target, device=self.device)] = warp_faces(
-                    flat, height, width, torch.tensor([position for position, _ in wanted], device=self.device),
-                    np.stack([geometry[row][0] for row in target]), size,
-                    offsets=np.array([geometry[row][1:] for row in target]), zero_border=True,
-                )
-                done[target] = True
-        except Exception:
-            if not done.any():
-                raise AnalysisFailed("decode_failed")
-        return crops, done
 
 
 def phase_clips(track: list[Candidate], phases: int, clip_length: int, stride: int, max_gap: float) -> tuple[list[list[Candidate]], int]:
@@ -905,12 +1220,49 @@ class DetectorService:
         self._lut_rgb, self._lut_alpha = lut[:, :3], lut[:, 3] / 255.0
         feather = _edge_feather(self.faces.size)
         self._feather = torch.from_numpy(feather.astype(np.float32)).to(self.device)
-        # One GPU, one request at a time keeps memory predictable.
-        self._lock = threading.Lock()
+        # Several scans share the GPU (see ScanGate). The model pass, their largest memory step, runs
+        # on ``heavy_slots`` shared streams (one by default), one scan at a time per stream.
+        self.gate = ScanGate(scan_slots(self.device), self.device)
+        heavy = int(os.environ.get("ORIGINAI_HEAVY_SLOTS", "0") or 0) or 1
+        self.heavy_slots = min(heavy, self.gate.slots)
+        self._heavy = threading.BoundedSemaphore(self.heavy_slots)
+        self._heavy_streams: queue.Queue = queue.Queue()
+        if self.device.type == "cuda":
+            for _ in range(self.heavy_slots):
+                self._heavy_streams.put(torch.cuda.Stream(self.device, priority=0))
         if self.device.type == "cuda":
             self._warm_up()
 
     # -- scoring -----------------------------------------------------------
+    @contextlib.contextmanager
+    def _model_pass(self):
+        """Run the block on a shared model-pass stream (at most ``heavy_slots`` blocks at once).
+
+        PyTorch caches freed GPU memory per stream, so a pass on every scan's own stream would keep
+        its few GB of temporaries reserved once per scan. The pass stream waits for the caller's stream before
+        starting, and the caller's stream waits for the pass after; tensors the pass returns on the
+        GPU are handed to the caller's stream with ``_handover``."""
+        with self._heavy:
+            if self.device.type != "cuda":
+                yield
+                return
+            stream = self._heavy_streams.get()
+            caller = torch.cuda.current_stream(self.device)
+            try:
+                stream.wait_stream(caller)
+                with torch.cuda.stream(stream):
+                    yield
+                caller.wait_stream(stream)
+            finally:
+                self._heavy_streams.put(stream)
+
+    def _handover(self, tensor: torch.Tensor | None) -> torch.Tensor | None:
+        """A GPU tensor made in ``_model_pass``, now used on the caller's stream: tell the allocator
+        so its memory is not reused by the pass stream while the caller still reads it."""
+        if tensor is not None and tensor.is_cuda:
+            tensor.record_stream(torch.cuda.current_stream(self.device))
+        return tensor
+
     def _autocast(self):
         if self.amp_dtype is None:
             return contextlib.nullcontext()
@@ -921,14 +1273,16 @@ class DetectorService:
         """Clip logits and their final-stage token contributions (K x 8 x 7 x 7, on device)."""
         last = len(net.backbone.features) - 1
         logits, maps = [], []
-        for i in range(0, len(clip_index), self.batch_size):
-            x = crops[clip_index[i : i + self.batch_size]].permute(0, 1, 4, 2, 3)  # B,T,C,H,W uint8
-            with self._autocast():
-                activation = net.stage_activation(x, last)
-            clip_logits, contributions = net.readout(activation)
-            logits.append(clip_logits)
-            maps.append(contributions)
-        return torch.cat(logits).double().cpu().numpy(), torch.cat(maps)
+        with self._model_pass():
+            for i in range(0, len(clip_index), self.batch_size):
+                x = crops[clip_index[i : i + self.batch_size]].permute(0, 1, 4, 2, 3)  # B,T,C,H,W uint8
+                with self._autocast():
+                    activation = net.stage_activation(x, last)
+                clip_logits, contributions = net.readout(activation)
+                logits.append(clip_logits)
+                maps.append(contributions)
+            logits, maps = torch.cat(logits).double().cpu().numpy(), torch.cat(maps)
+        return logits, self._handover(maps)
 
     @torch.inference_mode()
     def _score_fcg(self, net: dfd_fcg.DfdFcg, crops: torch.Tensor, clip_index: torch.Tensor,
@@ -938,17 +1292,19 @@ class DetectorService:
         ``crops``, the 150 x 150 face crops. The image encoder runs in half precision on the
         GPU, as in the authors' evaluation."""
         probs, logits, maps = [], [], []
-        for i in range(0, len(clip_index), self.fcg_batch):
-            rows = clip_index[i : i + self.fcg_batch]
-            x = dfd_fcg.prepare_frames(crops[rows.flatten()]).unflatten(0, tuple(rows.shape))
-            with torch.autocast("cuda", dtype=torch.float16) if self.device.type == "cuda" else contextlib.nullcontext():
-                out = net(x, evidence=evidence)
-            probs.append(out["prob_fake"])
-            logits.append(out["logit"])
-            if evidence:
-                maps.append(out["evidence"])
-        return (torch.cat(probs).double().cpu().numpy(), torch.cat(logits).double().cpu().numpy(),
-                torch.cat(maps) if evidence else None)
+        with self._model_pass():
+            for i in range(0, len(clip_index), self.fcg_batch):
+                rows = clip_index[i : i + self.fcg_batch]
+                x = dfd_fcg.prepare_frames(crops[rows.flatten()]).unflatten(0, tuple(rows.shape))
+                with torch.autocast("cuda", dtype=torch.float16) if self.device.type == "cuda" else contextlib.nullcontext():
+                    out = net(x, evidence=evidence)
+                probs.append(out["prob_fake"])
+                logits.append(out["logit"])
+                if evidence:
+                    maps.append(out["evidence"])
+            probs, logits = torch.cat(probs).double().cpu().numpy(), torch.cat(logits).double().cpu().numpy()
+            maps = torch.cat(maps) if evidence else None
+        return probs, logits, self._handover(maps)
 
     def _warm_up(self) -> None:
         """Compile/initialise every CUDA kernel once so the first request is not slow."""
@@ -1006,7 +1362,7 @@ class DetectorService:
         crops = crops.permute(0, 3, 1, 2).float()
         crop_heat = (crops * (1 - alpha) + rgb * alpha).round().clamp(0, 255).to(torch.uint8)
 
-        previews = video.previews[torch.tensor([c.record.preview_index for c in chosen], device=self.device)].float()
+        previews = video.previews[[c.record.preview_index for c in chosen]].to(self.device).float()
         ph, pw = previews.shape[2:]
         mats = torch.from_numpy(np.asarray(mats).astype(np.float64)).to(self.device)
         mats[:, :, :2] /= video.preview_scale  # preview pixels -> crop pixels
@@ -1052,12 +1408,24 @@ class DetectorService:
         entry = self.models.get(model_id)
         if entry is None:
             raise KeyError(model_id)
-        with self._lock:
-            try:
+        try:
+            with self.gate.slot():
                 return self._analyze(video_path, entry)
-            finally:
-                if self.device.type == "cuda":
-                    torch.cuda.empty_cache()
+        except Exception as exc:
+            if not _is_oom(exc):
+                raise
+            log.warning("Out of GPU memory next to other scans; re-running this scan on its own")
+        gc.collect()  # the failed attempt's tensors
+        with self.gate.slot(exclusive=True):
+            torch.cuda.empty_cache()
+            return self._analyze(video_path, entry)
+
+    def status(self) -> dict:
+        return {**self.gate.status(), "heavy_slots": self.heavy_slots}
+
+    def _sync(self) -> None:
+        if self.device.type == "cuda":
+            torch.cuda.current_stream(self.device).synchronize()
 
     def _readout_fcg(self, entry: ModelEntry, probs: np.ndarray) -> dict:
         """DFD-FCG's video score is the mean of its clips' fake probabilities (the authors' rule)."""
@@ -1077,39 +1445,30 @@ class DetectorService:
         10-frame clips. The authors' own evaluation (one clip per whole 3 seconds) is reported
         alongside as ``protocol``."""
         t = time.perf_counter()
-        track, ambiguous = self.faces.track(dense, entry.clip_length)
-        track = [c for c in track if c.points68 is not None]
-        geometry = dfd_fcg.crop_geometry(
-            np.stack([c.points68 for c in track]) if track else np.empty((0, 68, 2), np.float32),
-            np.array([c.record.frame_index for c in track], dtype=np.int64), video.frames_decoded)
-        kept = [i for i, g in enumerate(geometry) if g is not None]
-        track, geometry = [track[i] for i in kept], [geometry[i] for i in kept]
+        canvas = video.canvas
+        # The tracker ran during the pass (same tracker, same checks); the crops were cut there too,
+        # for the tracked faces that have landmarks and a crop transform (dfd_fcg.crop_geometry).
+        _, ambiguous = self.faces.track(dense, entry.clip_length, result=canvas.tracker.result())
+        track, geometry, crops = [c for c, _ in canvas.kept], [g for _, g in canvas.kept], canvas.crops
         if len(track) < entry.clip_length:
             raise AnalysisFailed("insufficient_valid_frames")
         timings["tracking"] = time.perf_counter() - t
 
         t = time.perf_counter()
-        crops, done = self.faces.canvas_crops(video_path, track, geometry, dfd_fcg.CROP_SIZE)
-        if not done.all():
-            kept = np.flatnonzero(done).tolist()
-            track, geometry = [track[i] for i in kept], [geometry[i] for i in kept]
-            crops = crops[torch.tensor(kept, device=self.device)]
         clips, segments = phase_clips(
             track, phases, entry.clip_length, int(self.fcg_cfg.get("clip_stride_in_phase", entry.clip_length)),
             float(self.whole["max_gap_factor"]) * max(spacing, entry.frame_spacing_s),
         )
         if not clips:
             raise AnalysisFailed("insufficient_valid_frames")
-        if self.device.type == "cuda":
-            torch.cuda.synchronize()
+        self._sync()
         timings["face_crops"] = time.perf_counter() - t
 
         t = time.perf_counter()
         rows = {id(c): row for row, c in enumerate(track)}
         index = torch.tensor([[rows[id(c)] for c in clip] for clip in clips], device=self.device)
         probs, logits, maps = self._score_fcg(entry.net, crops, index)
-        if self.device.type == "cuda":
-            torch.cuda.synchronize()
+        self._sync()
         timings["inference"] = time.perf_counter() - t
 
         # The authors' evaluation: one clip per whole 3 seconds, 10 frames spread evenly over it.
@@ -1138,8 +1497,7 @@ class DetectorService:
         hc = self.heatmap_cfg
         fcg = entry.arch == "dfd_fcg"
         video = self.faces.read(video_path, entry.frame_spacing_s, landmarks=fcg)
-        if self.device.type == "cuda":
-            torch.cuda.synchronize()
+        self._sync()
         timings["decode_detect_align"] = time.perf_counter() - t0
         timings.update({f"stage_{k}": v for k, v in video.timings.items()})
 
@@ -1328,8 +1686,7 @@ class DetectorService:
         t = time.perf_counter()
         index = torch.tensor([[c.crop_index for c in clip] for clip in clips], device=self.device)
         logits, contributions = self._score(entry.net, video.crops, index)
-        if self.device.type == "cuda":
-            torch.cuda.synchronize()
+        self._sync()
         timings["inference"] = time.perf_counter() - t
         return {
             "protocol": protocol, "clips": clips, "track": track, "ambiguous": ambiguous, "segments": segments,
@@ -1340,21 +1697,18 @@ class DetectorService:
     def benchmark(self, model_id: str) -> dict:
         """Synthetic scoring pass used by the Vast PyWorker benchmark."""
         entry = self.models[model_id]
-        if entry.arch == "dfd_fcg":
-            size, length = dfd_fcg.CROP_SIZE, entry.clip_length
-            crops = torch.randint(0, 255, (length * 2, size, size, 3), dtype=torch.uint8, device=self.device)
-            t = time.perf_counter()
-            with self._lock:
+        with self.gate.slot():
+            if entry.arch == "dfd_fcg":
+                size, length = dfd_fcg.CROP_SIZE, entry.clip_length
+                crops = torch.randint(0, 255, (length * 2, size, size, 3), dtype=torch.uint8, device=self.device)
+                t = time.perf_counter()
                 _, logits, _ = self._score_fcg(entry.net, crops, torch.arange(length * 2, device=self.device).view(2, length))
-                if self.device.type == "cuda":
-                    torch.cuda.synchronize()
-            return {"seconds": time.perf_counter() - t, "logits": [float(v) for v in logits]}
-        size = self.faces.size
-        crops = torch.randint(0, 255, (self.clip_length * 2, size, size, 3), dtype=torch.uint8, device=self.device)
-        index = torch.arange(self.clip_length * 2, device=self.device).view(2, self.clip_length)
-        t = time.perf_counter()
-        with self._lock:
+                self._sync()
+                return {"seconds": time.perf_counter() - t, "logits": [float(v) for v in logits]}
+            size = self.faces.size
+            crops = torch.randint(0, 255, (self.clip_length * 2, size, size, 3), dtype=torch.uint8, device=self.device)
+            index = torch.arange(self.clip_length * 2, device=self.device).view(2, self.clip_length)
+            t = time.perf_counter()
             logits, _ = self._score(entry.net, crops, index)
-            if self.device.type == "cuda":
-                torch.cuda.synchronize()
-        return {"seconds": time.perf_counter() - t, "logits": [float(v) for v in logits]}
+            self._sync()
+            return {"seconds": time.perf_counter() - t, "logits": [float(v) for v in logits]}

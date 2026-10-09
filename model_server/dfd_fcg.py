@@ -357,17 +357,30 @@ class Landmarker:
         self.half = device.type == "cuda"
         self.net.to(device, dtype=torch.float16 if self.half else torch.float32)
 
+    CHUNK = 16  # faces per network call; always this many (see ``run``)
+
     @torch.inference_mode()
-    def __call__(self, frames: torch.Tensor, frame_inds: list[int], boxes: np.ndarray, chunk: int = 16) -> np.ndarray:
+    def __call__(self, frames: torch.Tensor, frame_inds: list[int], boxes: np.ndarray) -> np.ndarray:
         """frames: (B, 3, H, W) uint8 on the device. ``boxes`` (K, 4): one S3FD-style box per face,
         in frame pixels, for the face in ``frames[frame_inds[k]]``.
 
         Returns (K, 68, 2) float32 in frame pixels: whole pixels of the scaled frame, divided by
         the scale (as the authors store them). Faces whose box is unusable get NaN."""
+        inputs, geometry = self.inputs(frames, frame_inds, boxes)
+        return self.points(self.run(inputs), geometry)
+
+    @torch.inference_mode()
+    def inputs(self, frames: torch.Tensor, frame_inds: list[int], boxes: np.ndarray) -> tuple[torch.Tensor, dict]:
+        """The network inputs for these faces, (k, 256, 256, 3) uint8 on the device (one per usable
+        box), and what ``points`` needs to turn the network's answer into frame pixels.
+
+        Splitting this from ``run`` lets the caller collect faces from several frame batches and
+        run the network on full chunks only."""
         count = len(frame_inds)
-        points = np.full((count, 68, 2), np.nan, dtype=np.float32)
+        geometry = {"count": count, "keep": np.zeros(0, dtype=np.int64)}
+        empty = torch.empty((0, FAN_INPUT, FAN_INPUT, 3), dtype=torch.uint8, device=self.device)
         if not count:
-            return points
+            return empty, geometry
         height, width = frames.shape[2:]
         scale = MAX_LANDMARK_RES / max(height, width) if max(height, width) > MAX_LANDMARK_RES else 1
         if scale != 1:  # cv2.resize(frame, None, fx=scale, fy=scale): bilinear, half-pixel centres
@@ -391,29 +404,48 @@ class Landmarker:
         usable = np.isfinite(side) & ((br - ul) >= 2).all(axis=1)
         keep = np.flatnonzero(usable)
         if not len(keep):
-            return points
+            return empty, geometry
 
         inds = torch.as_tensor(np.asarray(frame_inds)[keep], device=self.device)
         ul_t, br_t = torch.as_tensor(ul[keep], device=self.device), torch.as_tensor(br[keep], device=self.device)
-        heatmaps = []
-        for s in range(0, len(keep), chunk):
-            crops = self._crops(flat, hs, ws, inds[s : s + chunk], ul_t[s : s + chunk], br_t[s : s + chunk])
-            inp = crops.permute(0, 3, 1, 2).div(255.0)
-            # Always ``chunk`` faces per call: TorchScript re-optimises the network for every new input
-            # shape, which made this step take 1 to 30 seconds per video. Each face is independent
-            # (eval mode), so the zero padding changes nothing.
-            count = len(inp)
-            if count < chunk:
-                inp = torch.cat([inp, inp.new_zeros((chunk - count, *inp.shape[1:]))])
-            heatmaps.append(self.net(inp.half() if self.half else inp).float()[:count])
-        peaks = self._peaks(torch.cat(heatmaps)).double().cpu().numpy()  # (K, 68, 2) on the 64 x 64 grid
+        # utils.crop rounds to whole values in 0..255, so uint8 holds the inputs exactly.
+        crops = torch.cat([self._crops(flat, hs, ws, inds[s : s + self.CHUNK], ul_t[s : s + self.CHUNK], br_t[s : s + self.CHUNK])
+                           for s in range(0, len(keep), self.CHUNK)]).to(torch.uint8)
+        geometry.update(keep=keep, side=side[keep], cx=cx[keep], cy=cy[keep], scale=scale)
+        return crops, geometry
 
+    @torch.inference_mode()
+    def run(self, crops: torch.Tensor) -> torch.Tensor:
+        """The network on (k, 256, 256, 3) uint8 inputs -> (k, 68, 2) heatmap peaks on the 64 x 64
+        grid, on the device. Always ``CHUNK`` faces per call: TorchScript re-optimises the network
+        for every new input shape, which made this step take 1 to 30 seconds per video. Each face
+        is independent (eval mode), so the zero padding of a last, partial chunk changes nothing."""
+        heatmaps = []
+        for s in range(0, len(crops), self.CHUNK):
+            inp = crops[s : s + self.CHUNK].permute(0, 3, 1, 2).float().div(255.0)
+            count = len(inp)
+            if count < self.CHUNK:
+                inp = torch.cat([inp, inp.new_zeros((self.CHUNK - count, *inp.shape[1:]))])
+            heatmaps.append(self.net(inp.half() if self.half else inp).float()[:count])
+        if not heatmaps:
+            return torch.empty((0, 68, 2), device=self.device)
+        return self._peaks(torch.cat(heatmaps))
+
+    @staticmethod
+    def points(peaks: torch.Tensor | np.ndarray, geometry: dict) -> np.ndarray:
+        """(count, 68, 2) float32 frame pixels from ``run``'s peaks for the faces ``inputs`` kept."""
+        points = np.full((geometry["count"], 68, 2), np.nan, dtype=np.float32)
+        keep = geometry["keep"]
+        if not len(keep):
+            return points
+        peaks = peaks.double().cpu().numpy() if isinstance(peaks, torch.Tensor) else np.asarray(peaks, dtype=np.float64)
         # utils.transform_np(invert=True) from the 64 x 64 grid to the scaled frame, truncated to
         # whole pixels, then back to the frame's own resolution.
-        cell = side[keep] / FAN_OUTPUT
-        origin = np.stack([cx[keep], cy[keep]], axis=1).astype(np.float64) - side[keep, None] / 2
+        side, cx, cy = geometry["side"], geometry["cx"], geometry["cy"]
+        cell = side / FAN_OUTPUT
+        origin = np.stack([cx, cy], axis=1).astype(np.float64) - side[:, None] / 2
         pixels = np.trunc(peaks * cell[:, None, None] + origin[:, None, :])
-        points[keep] = pixels.astype(np.float32) / np.float32(scale)
+        points[keep] = pixels.astype(np.float32) / np.float32(geometry["scale"])
         return points
 
     def _crops(self, flat: torch.Tensor, hs: int, ws: int, inds: torch.Tensor, ul: torch.Tensor,
@@ -484,31 +516,38 @@ def crop_geometry(points: np.ndarray, frame_index: np.ndarray, total_frames: int
     """
     points = np.asarray(points, dtype=np.float32)
     frame_index = np.asarray(frame_index, dtype=np.int64)
-    reference = MEAN_FACE[list(STABLE_POINTS)].copy()
+    return [frame_crop_geometry(points, frame_index, i, total_frames) for i in range(len(frame_index))]
+
+
+_REFERENCE = MEAN_FACE[list(STABLE_POINTS)].copy()
+
+
+def frame_crop_geometry(points: np.ndarray, frame_index: np.ndarray, i: int,
+                        total_frames: int) -> tuple[np.ndarray, int, int] | None:
+    """``crop_geometry`` for the i-th frame. It reads only the frames within 6 of it, so it can be
+    called as soon as those are known (``points`` (N, 68, 2) float32 and ``frame_index`` (N,) int64
+    in frame order, holding at least every tracked frame up to 6 after this one)."""
     half = CROP_SIZE // 2
-    geometry: list[tuple[np.ndarray, int, int] | None] = []
-    for i, frame in enumerate(frame_index):
-        margin = min(SMOOTH_WINDOW // 2, int(frame), total_frames - 1 - int(frame))
-        lo = np.searchsorted(frame_index, frame - margin, side="left")
-        hi = np.searchsorted(frame_index, frame + margin, side="right")
-        smoothed = np.mean(points[lo:hi], axis=0)
-        smoothed += points[i].mean(axis=0) - smoothed.mean(axis=0)
-        matrix = cv2.estimateAffinePartial2D(smoothed[list(STABLE_POINTS)], reference, method=cv2.LMEDS)[0]
-        if matrix is None or not np.isfinite(matrix).all():
-            geometry.append(None)
-            continue
-        moved = np.matmul(smoothed, matrix[:, :2].transpose()) + matrix[:, 2].transpose()
-        cx, cy = np.mean(moved[CENTRE_FROM:], axis=0)
-        if cy - half < 0:
-            cy = half + 1
-        elif cy + half > CANVAS:
-            cy = CANVAS - half - 1
-        if cx - half < 0:
-            cx = half + 1
-        elif cx + half > CANVAS:
-            cx = CANVAS - half - 1
-        geometry.append((matrix, int(cx - half), int(cy - half)))
-    return geometry
+    frame = frame_index[i]
+    margin = min(SMOOTH_WINDOW // 2, int(frame), total_frames - 1 - int(frame))
+    lo = np.searchsorted(frame_index, frame - margin, side="left")
+    hi = np.searchsorted(frame_index, frame + margin, side="right")
+    smoothed = np.mean(points[lo:hi], axis=0)
+    smoothed += points[i].mean(axis=0) - smoothed.mean(axis=0)
+    matrix = cv2.estimateAffinePartial2D(smoothed[list(STABLE_POINTS)], _REFERENCE, method=cv2.LMEDS)[0]
+    if matrix is None or not np.isfinite(matrix).all():
+        return None
+    moved = np.matmul(smoothed, matrix[:, :2].transpose()) + matrix[:, 2].transpose()
+    cx, cy = np.mean(moved[CENTRE_FROM:], axis=0)
+    if cy - half < 0:
+        cy = half + 1
+    elif cy + half > CANVAS:
+        cy = CANVAS - half - 1
+    if cx - half < 0:
+        cx = half + 1
+    elif cx + half > CANVAS:
+        cx = CANVAS - half - 1
+    return matrix, int(cx - half), int(cy - half)
 
 
 def input_matrix(matrix: np.ndarray, left: int, top: int) -> np.ndarray:

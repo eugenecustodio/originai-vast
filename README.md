@@ -42,7 +42,7 @@ the original CPU code:
 
 | Step | Implementation | Check against training |
 |---|---|---|
-| Decode | torchcodec: NVDEC on the GPU. Falls back to FFmpeg or PyAV on the CPU | CPU decode is bit-identical to the thesis PyAV rgb24 frames (40/40) |
+| Decode | torchcodec on the CPU, frames uploaded in a background thread while the GPU works (`models.json → inference.gpu_decode` is false; PyAV is the last fallback) | Bit-identical to the thesis PyAV rgb24 frames (40/40; re-checked in October 2026 on 300/300 frames of a 1080p H.264 video). torchcodec's GPU path is off: NVDEC, or where NVDEC declines a video (it did for plain 1080p H.264 on the RTX 3090/5090 hosts tested) its CPU fallback with GPU colour conversion, differs by up to 2/255, and its uploads are not ordered with the per-scan CUDA streams of [Several scans on one GPU](#several-scans-on-one-gpu) |
 | Face detection | `gpu_mtcnn.py`: facenet-pytorch 2.6.0 MTCNN, same weights and thresholds. Stages 2 and 3 crop every box in one gather using an exact summed-area table instead of a Python loop | Identical boxes, probabilities and landmarks (max difference 0 at 640×480 and 1080p) |
 | Alignment | Fixed-point bilinear warp on the GPU to the ArcFace template, 224×224, REFLECT_101 | Pixel-identical to OpenCV 4.11 `warpAffine` (60/60 crops) |
 | Identity tracking | FaceNet vggface2 embeddings on the GPU; the thesis tracker logic runs on the CPU (tiny) | Same rule and thresholds |
@@ -98,6 +98,48 @@ Portrait phone videos are rotated upright before face detection.
 
 **Proxy.** The website proxy (`backend/server.py`) exposes `POST /api/analyses`, `GET /api/analyses/{id}` and `GET /api/analyses/{id}/media/{file}`. It writes the heatmap images to `backend/outputs/analyses/<id>/`, replaces the base64 with URLs, and deletes them after an hour.
 
+## Several scans on one GPU
+
+One scan keeps the GPU busy only part of the time: much of it is decoding, face tracking and short GPU steps
+that wait on each other (on an RTX 5090 a single scan kept the GPU busy about 35-40% of the time). The model
+server therefore runs several scans at once (`ScanGate` in `detector.py`) and queues the rest, first come
+first served. The PyWorker passes requests straight through (`allow_parallel_requests` in `worker.py`).
+
+- **How many at once:** `ORIGINAI_CONCURRENCY`, or by default what GPU memory, CPU cores and host memory
+  allow (`scan_slots`): 3 on an RTX 5090 with at least 12 cores, 2 on a 24 GB card, 1 on a 16 GB card, never
+  more than 4. `/health` reports it under `scans`.
+- **Streams:** each scan runs on its own high-priority CUDA stream and waits only on that stream, so its many
+  small steps (face detection, alignment) run while other scans wait on the CPU. The model pass (Video Swin /
+  the CLIP encoder) runs on one shared lower-priority stream, one scan at a time (`ORIGINAI_HEAVY_SLOTS`):
+  PyTorch caches freed GPU memory per stream, so a pass on every scan's own stream would keep its few GB of
+  temporaries reserved once per scan.
+- **Decoding stays on the CPU** (see [Preprocessing](#preprocessing-the-frozen-thesis-contract-on-the-gpu)):
+  torchcodec's GPU decoder orders its uploads only against the default stream. With per-scan streams it made
+  results vary between runs and, with several scans on the same GPU, raised a device-side assert that broke
+  the process. The GPU JPEG encoder has the same habit; `_jpegs` synchronises around it.
+- **No scan fails because others are running.** `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` avoids most
+  fragmentation; a scan that still runs out of GPU memory is re-run on its own, ahead of the queue; and running
+  out of memory is never reported as a decoding failure. Frame previews (for the evidence images) stay in host
+  memory; only the ~40 frames shown go to the GPU.
+- **Same results:** for the Video Swin models every scan is bit-identical to the one-at-a-time code with the
+  same decoder (scores, timelines and evidence images, at 1 to 4 scans at once). `CUBLAS_WORKSPACE_CONFIG=:4096:8`
+  keeps cuBLAS from picking different kernels when several streams are busy. DFD-FCG varies in the 4th decimal
+  from run to run, as it did before.
+
+**Measured on an RTX 5090** (12 CPU cores; 24 scans: every model on a 2-minute 1080p30 and a 15 s 1080p clip;
+the heaviest test: several 2-minute 1080p60 videos at once):
+
+| | Before (one at a time) | 1 at a time | 2 at once | **3 at once** | 4 at once |
+|---|---|---|---|---|---|
+| Mixed workload, scans/min | 3.75 | 4.41 | 7.4 | **8.65** | 7.95 |
+| Mean time per scan (incl. queueing) | 31.7 s | 27.1 s | 24.0 s | **25.5 s** | 32.9 s |
+| 2-min 1080p60 videos, scans/min | 1.2 | | 2.09 | **2.56** | 2.61 |
+| Peak GPU memory | 16.2 GB | 13.8 GB | 19.9 GB | **23.9 GB** | 28.4 GB |
+| Failed scans | 0 | 0 | 0 | **0** | 0 |
+
+"Before" is the code until October 2026, one scan at a time with the GPU decoder's CPU fallback; 1 at a time
+already includes the single-pass DFD-FCG crops. With 4 at once the 12 CPU cores were the limit.
+
 ## Vidi: DFD-FCG
 
 Since October 2026, Vidi is DFD-FCG: Han, Huang, Hua and Chen, *Towards More General Video-based Deepfake
@@ -128,9 +170,9 @@ authors' checkpoint with every weight accounted for):
 | Step | The authors | This worker |
 |---|---|---|
 | Faces | S3FD on every frame, then their own landmark-motion tracker picks the longest-lived face | The MTCNN detector and FaceNet identity tracker shared with the other detectors. Each MTCNN box is converted to the box S3FD gives for the same face (`SFD_FROM_MTCNN`: medians over 752 faces of 11 sample videos; the square 2D-FAN then looks at lands within 1% of its side and 3.5% of its size of the real S3FD one) |
-| Landmarks | 2D-FAN (face_alignment 1.4.1), frame scaled to at most 800 px, half precision | The same TorchScript model and the same steps (`dfd_fcg.Landmarker`), batched on the GPU |
-| Alignment | Landmarks averaged over +-6 frames and re-centred; similarity transform of 8 stable points onto the LRW mean face, 256 x 256 (`cv2.estimateAffinePartial2D`, LMedS) | The same code path (`crop_geometry`) |
-| Crop | 150 x 150 around the mean of landmarks 15..67, `cv2.warpAffine`, black border | The same, cut from the full-resolution frame in a second decoding pass (`FacePipeline.canvas_crops`): the crop needs landmarks of the frames around it and the tracker's choice of face, which are only known after the first pass |
+| Landmarks | 2D-FAN (face_alignment 1.4.1), frame scaled to at most 800 px, half precision | The same TorchScript model and the same steps (`dfd_fcg.Landmarker`), batched on the GPU in full chunks of 16 faces collected over frame batches (`detector._LandmarkQueue`; per-batch calls padded a 19-frame batch's last 3 faces up to 16) |
+| Alignment | Landmarks averaged over +-6 frames and re-centred; similarity transform of 8 stable points onto the LRW mean face, 256 x 256 (`cv2.estimateAffinePartial2D`, LMedS) | The same code path (`crop_geometry`, one frame at a time in `frame_crop_geometry`) |
+| Crop | 150 x 150 around the mean of landmarks 15..67, `cv2.warpAffine`, black border | The same, cut from the full-resolution frame during the one decoding pass (`detector._CanvasCrops`): the tracker only looks back, so its choice for a frame is final once the frame is read, and a crop is cut as soon as the tracked faces 6 frames ahead have their landmarks, from the few recent frame batches kept on the GPU. Until October 2026 this took a second decoding pass |
 | Input | 224 x 224 bicubic with antialiasing, CLIP normalisation | The same (`prepare_frames`) |
 
 **Checked against the authors' code** (their preprocessing and model classes, run unmodified on the CPU, on the
@@ -164,8 +206,9 @@ took 3 to 5 s. Most of the rest was the landmark step, which TorchScript re-opti
 since `7a98916` its batches are always 16 faces, so it compiles once at start (on scans that had already
 compiled, it took 1 to 2 s).
 
-**Cost.** The landmark model runs on every face, and the video is decoded twice. The clips of a 2-minute video
-are about 3,600 frames through a ViT-L/14.
+**Cost.** The landmark model runs on every face, and the clips of a 2-minute video are about 3,600 frames
+through a ViT-L/14. Since the crops are cut in the first pass, a 2-minute 1080p30 video takes about 29 s on an
+RTX 5090 instead of 48 s (2-minute 1080p60: 54 s instead of 84 s).
 
 ## Deploy
 
@@ -177,19 +220,22 @@ Repository layout (this repo is public and holds code only):
 
 The checkpoints stay private in the Backblaze bucket. Each worker downloads them at start with a read-only key (`B2_KEY_ID`, `B2_APP_KEY` in the Vast template) and checks every file's SHA-1 against `models.json`.
 
-1. **Image:** pushing to `main` builds `:latest` / `:cu126`. For RTX 50-series hosts, run the workflow manually with `cu130`.
+1. **Image:** pushing to `main` builds `:latest` / `:cu126`. For RTX 50-series hosts (the endpoint uses RTX 5090s
+   since October 2026), run the workflow manually with `cu130`; that image needs a driver for CUDA ≥ 13.0.
 2. **Vast template:**
-   - image: `ghcr.io/<owner>/originai-worker:cu126`
+   - image: `ghcr.io/<owner>/originai-worker:cu130-<commit>` (RTX 5090) or `cu126-<commit>` (RTX 30/40, A-series)
    - Docker options: `-p 3000:3000 -e PYWORKER_REPO=<this repo> -e B2_KEY_ID=… -e B2_APP_KEY=…`
    - on-start: `bash /onstart.sh`
 3. **Endpoint settings:** `min_load 0` (no GPU running when idle), `cold_workers 0` (nothing rented when idle),
    `max_workers 1`, `inactivity_timeout 300`. The first scan after an idle period waits for a 5–10 minute cold start.
    `cold_workers 1` would keep one stopped worker with the image and checkpoints on its disk (resumes in about a
    minute) at the cost of disk storage while it waits.
-4. **Worker group:** one GPU with ≥ 12 GB and bf16 support (compute capability 8.x/9.x), a driver that supports CUDA ≥ 12.6, and a price cap of `dph_total<=0.20`.
-   In practice that means an RTX 3060, A4000, 3090 or 4070 Super at about $0.06–0.17/hr. Without the cap, Vast picked an RTX 4090 at $0.45/hr.
-   (A cap of 0.15 was too tight: the cheap cards were often taken and a $0.16/hr RTX 3090 was the best match.)
+4. **Worker group:** since October 2026 one RTX 5090 (`gpu_name=RTX_5090`, compute capability below 13.0, a driver
+   for CUDA ≥ 13.0), at least 12 CPU cores and a price cap of `dph_total<=0.50`. Before that: one GPU with ≥ 12 GB and
+   bf16 support (compute capability 8.x/9.x), a driver for CUDA ≥ 12.6, `dph_total<=0.20`, which in practice meant an
+   RTX 3060, A4000, 3090 or 4070 Super at about $0.06–0.17/hr.
    The group also requires `static_ip=true` and excludes machines that failed (`machine_id nin [137275,150851]`), see below.
+   One worker runs several scans at once (see [Several scans on one GPU](#several-scans-on-one-gpu)).
 
 **Measured on Vast (every frame analysed):**
 
@@ -202,7 +248,7 @@ The checkpoints stay private in the Backblaze bucket. Each worker downloads them
 The first request after the endpoint scales to zero also waits for a cold start of about 5–10 minutes.
 
 **Operating notes:**
-- **Pin image tags.** Point the template at `cu126-<commit>`, not `cu126` or `latest`: Vast hosts cache tags that are re-pointed and can start an old image.
+- **Pin image tags.** Point the template at `cu130-<commit>` / `cu126-<commit>`, not `cu130`, `cu126` or `latest`: Vast hosts cache tags that are re-pointed and can start an old image.
 - **Replace workers after changing the template or image.** Updating the worker group's template recycles its workers. A recycled worker can keep a stale routing signature and answer every request with HTTP 401, so destroy the endpoint's workers (`vastai destroy instance <id> -y`) and let fresh ones start.
 - **A worker that is "idle" but never receives scans is a bad host.** The worker log shows `num_requests_recieved: 0`
   while scans wait, and the client (with `debug=True`) logs `Worker unavailable (...)`. Seen so far:

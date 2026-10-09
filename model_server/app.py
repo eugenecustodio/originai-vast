@@ -26,7 +26,14 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-from detector import AnalysisFailed, DetectorService
+# Several scans share the GPU: let PyTorch's caching allocator grow and shrink its memory
+# segments instead of keeping fixed blocks, which avoids most fragmentation (set before torch loads).
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+# cuBLAS may pick different internal implementations when several streams are in use, which
+# makes results vary from run to run; a fixed workspace keeps every scan's numbers reproducible.
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+
+from detector import AnalysisFailed, DetectorService  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("originai")
@@ -49,7 +56,8 @@ def _load() -> None:
     global service
     t = time.time()
     service = DetectorService(REGISTRY, WEIGHTS_DIR, DEVICE, only=ONLY_MODELS)
-    log.info("Loaded %d models on %s in %.1fs", len(service.models), service.device, time.time() - t)
+    log.info("Loaded %d models on %s in %.1fs; up to %d scans at once (%d in the model pass)",
+             len(service.models), service.device, time.time() - t, service.gate.slots, service.heavy_slots)
 
 
 class AnalyzeRequest(BaseModel):
@@ -66,6 +74,7 @@ def health() -> dict:
         "status": "ready" if service else "loading",
         "device": str(service.device) if service else None,
         "models": list(service.models) if service else [],
+        "scans": service.status() if service else None,
     }
 
 

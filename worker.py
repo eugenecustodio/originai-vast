@@ -17,17 +17,18 @@ worker_config = WorkerConfig(
     handlers=[
         HandlerConfig(
             route="/analyze",
-            # One video at a time per GPU; extra requests wait in a FIFO queue.
-            allow_parallel_requests=False,
+            # Requests go straight to the model server, which runs several videos at once on the
+            # GPU and queues the rest first come, first served (ScanGate in model_server/detector.py).
+            allow_parallel_requests=True,
             max_queue_time=600.0,
-            # Longer videos take longer (whole-video tiling), but requests run one at a
-            # time, so a constant per-request cost keeps the autoscaler's view simple.
+            # Longer videos take longer (whole-video tiling); a constant per-request cost keeps
+            # the autoscaler's view simple.
             workload_calculator=lambda payload: 100.0,
             benchmark_config=BenchmarkConfig(
                 # Synthetic GPU pass - no video or face detection needed.
                 dataset=[{"model": m, "benchmark": True} for m in ("veni-hq", "veni-lq", "vidi", "vici")],
                 runs=4,
-                concurrency=1,
+                concurrency=int(os.environ.get("ORIGINAI_CONCURRENCY", "0") or 0) or 2,
             ),
         ),
     ],

@@ -117,13 +117,13 @@
     "max_frames": 7200
   },
   "inference": {
-    "_comment": "Swin clips per GPU batch (>=20 GB cards / smaller cards / CPU), FaceNet batch, pixel budget per face-detection batch, and NVDEC decoding (falls back to CPU decoding automatically).",
+    "_comment": "Swin clips per GPU batch (>=20 GB cards / smaller cards / CPU), FaceNet batch, pixel budget per face-detection batch, and GPU decoding. gpu_decode is off: torchcodec's CPU decoder is bit-identical to the thesis's PyAV rgb24 frames, while its GPU decoder (NVDEC, or on hosts where NVDEC declines a video its CPU fallback with GPU colour conversion) differs by up to 2/255 and is not safe with the per-scan CUDA streams of detector.ScanGate.",
     "batch_size_cuda": 16,
     "batch_size_cuda_small": 8,
     "batch_size_cpu": 2,
     "embed_batch": 256,
     "detect_pixel_budget": 40000000,
-    "gpu_decode": true
+    "gpu_decode": false
   },
   "heatmap": {
     "_comment": "Evidence maps: exact final-stage token contributions for the top_k most suspicious clips (spread over the video) + the least suspicious, oriented toward the verdict, rendered and JPEG-encoded on the GPU. Shown relative to this video: values at or below low_percentile are clear, high_percentile is full strength.",

@@ -14,7 +14,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PATH=/opt/venv/bin:$PATH \
     TORCH_HOME=/app/torch \
     MODEL_LOG=/var/log/originai/model.log \
-    NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility,video \
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    CUBLAS_WORKSPACE_CONFIG=:4096:8
 
 # python3.12 is Ubuntu 24.04's system Python (the thesis used 3.12).
 # git/curl/openssl are required by Vast's PyWorker start script. openssh-server is
