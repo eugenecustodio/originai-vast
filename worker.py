@@ -34,7 +34,11 @@ worker_config = WorkerConfig(
     ],
     log_action_config=LogActionConfig(
         on_load=["Application startup complete."],
-        on_error=["Traceback (most recent call last):", "Application startup failed"],
+        # Only a failed start is fatal (uvicorn and fetch_weights.py both print this). Any traceback used to count
+        # too, so one request that hit an unexpected error (e.g. a video download cut off midway) marked the whole
+        # worker as broken for the rest of its life and Vast replaced it: a 15-30 minute cold start for everyone.
+        # A model server that really stops answering is caught by the /health check above.
+        on_error=["Application startup failed"],
         on_info=["Loaded "],
     ),
 )
