@@ -38,7 +38,21 @@ worker_config = WorkerConfig(
         # too, so one request that hit an unexpected error (e.g. a video download cut off midway) marked the whole
         # worker as broken for the rest of its life and Vast replaced it: a 15-30 minute cold start for everyone.
         # A model server that really stops answering is caught by the /health check above.
-        on_error=["Application startup failed"],
+        # Also fatal: a host whose GPU PyTorch can't use (the server would load on the CPU, report ready and time
+        # out every scan), and CUDA errors that break the GPU context for good (every later scan fails or waits
+        # forever while /health stays green). Not "CUDA error" alone: an out-of-memory retry can log
+        # "CUDA error: CUBLAS_STATUS_ALLOC_FAILED", which the server recovers from.
+        on_error=[
+            "Application startup failed",
+            "models on cpu",
+            "illegal memory access",
+            "device-side assert",
+            "unspecified launch failure",
+            "misaligned address",
+            "uncorrectable ECC error",
+            "CUDA-capable device",
+            "CUDA error: unknown error",
+        ],
         on_info=["Loaded "],
     ),
 )
