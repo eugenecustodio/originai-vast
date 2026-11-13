@@ -33,14 +33,14 @@
     {
       "id": "vidi",
       "name": "Vidi",
-      "arch": "swinfusionpp",
-      "dataset": "Celeb-DF v2",
-      "checkpoint": "SwinFusion++ Celeb-DF v2.pt",
-      "temperature": 5.048615464522549,
-      "threshold": 0.3666147990601896,
-      "frame_spacing_s": 0.245,
-      "b2_path": "Thesis_Code/results/within__celeb_df_v2__swinfusionpp__fixed_v002__seed2203/checkpoints/selected.pt",
-      "sha1": "ae9c3f8ed220fdf002bc75d9a1bf68ad6d8ae08a"
+      "arch": "dfd_fcg",
+      "dataset": "FaceForensics++ C23 (DFD-FCG)",
+      "checkpoint": "DFD-FCG.ckpt",
+      "temperature": 1.0,
+      "threshold": 0.5,
+      "frame_spacing_s": 0.33,
+      "b2_path": "OriginAI/models/dfd-fcg/weights.ckpt",
+      "sha1": "e3bbb42930560ef351af93750950464cd7f8d9e2"
     },
     {
       "id": "vici",
