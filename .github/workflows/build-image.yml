@@ -58,4 +58,4 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
-            org.opencontainers.image.description=OriginAI Video Swin-B deepfake detectors (code only; weights fetched at start)
+            org.opencontainers.image.description=OriginAI SwinFusion++ deepfake detectors (code only; weights fetched at start)

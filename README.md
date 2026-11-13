@@ -1,8 +1,9 @@
 # OriginAI on Vast.ai Serverless
 
 Serves four detectors (their checkpoints are kept locally in the project's `models/` folder) from one Vast.ai
-Serverless endpoint: three of the thesis's Video Swin-B models, and DFD-FCG as "Vidi" (see
-[Vidi: DFD-FCG](#vidi-dfd-fcg)). Vast does not turn a model into an API by itself: `model_server/` *is*
+Serverless endpoint. **All four are SwinFusion++**, the thesis model: a Swin-B spatial encoder and a Video Swin-B
+temporal encoder fused at all four stages by TLBG-HCA (see [SwinFusion++](#swinfusion)), one trained per
+dataset. Vast does not turn a model into an API by itself: `model_server/` *is*
 the API. Vast runs it on GPUs on demand and routes signed requests to it. The website's
 `backend/server.py` is the only thing that talks to Vast, because every Vast call needs the
 Vast API key.
@@ -13,25 +14,56 @@ Browser ──multipart──► website server.py ──JSON (base64 video)─�
                                                               PyWorker :3000 ─► model server :18000
 ```
 
-| Model id  | Name    | Model        | Checkpoint             | Temperature T | Threshold* | Frame spacing Δ |
-|-----------|---------|--------------|------------------------|---------------|------------|-----------------|
-| `veni-hq` | Veni HQ | Video Swin-B | FF++ C23.pt            | 1.992         | 0.525      | 0.340 s |
-| `veni-lq` | Veni LQ | Video Swin-B | FF++ C40.pt            | 2.559         | 0.489      | 0.340 s |
-| `vidi`    | Vidi    | DFD-FCG      | DFD-FCG.ckpt           | 1 (none)      | 0.5        | 0.33 s  |
-| `vici`    | Vici    | Video Swin-B | DeeperForensics-1.0.pt | 1.396         | 0.832      | 0.345 s |
+| Model id  | Name    | Model        | Trained on (fixed recipe, run)    | Checkpoint                            | Temperature T | Threshold* | Frame spacing Δ |
+|-----------|---------|--------------|-----------------------------------|---------------------------------------|---------------|------------|-----------------|
+| `veni-hq` | Veni HQ | SwinFusion++ | FaceForensics++ C23, seed 1701    | SwinFusion++ FF++ C23.pt              | 1.825         | 0.663      | 0.340 s |
+| `veni-lq` | Veni LQ | SwinFusion++ | FaceForensics++ C40, seed 2203    | SwinFusion++ FF++ C40.pt              | 3.481         | 0.620      | 0.340 s |
+| `vidi`    | Vidi    | SwinFusion++ | Celeb-DF v2, seed 2203            | SwinFusion++ Celeb-DF v2.pt           | 5.049         | 0.367      | 0.245 s |
+| `vici`    | Vici    | SwinFusion++ | DeeperForensics-1.0, seed 3109    | SwinFusion++ DeeperForensics-1.0.pt   | 1.837         | 0.924      | 0.345 s |
 
-\* For the Video Swin-B models the threshold applies to the calibrated probability
-`sigmoid(mean_logit / T)`, exactly as in `Thesis_Code/src/swinfusionpp/p11_metric_stage.py`, and Δ is the
-median per-video frame spacing of each model's training split
-(`manifests/preprocessing_materialization_v001.parquet`). DFD-FCG has no validation run of ours: it is read at
-its authors' decision rule (mean clip probability ≥ 0.5).
+\* The threshold applies to the calibrated probability `sigmoid(mean_logit / T)`, exactly as in
+`Thesis_Code/src/swinfusionpp/p11_metric_stage.py`. T and the threshold are each run's own
+`validation_operating_point_v001.json` (temperature scaling and the maximum-Youden threshold, both fitted on
+validation videos before any test video was scored). Of the three fixed-recipe seeds trained per dataset, the one
+with the highest validation Youden's J is served (ties: lower validation BCE); test results played no part in the
+choice. Δ is the median per-video frame spacing of each model's training split
+(`manifests/preprocessing_materialization_v001.parquet`).
 
-Until October 2026 Vidi was the thesis's Video Swin-B model trained on Celeb-DF v2 (`Celeb-DF v2.pt`, T 5.016,
-threshold 0.229, Δ 0.245 s). That checkpoint is still in `models/` and in the Backblaze bucket; putting its
-entry back in `models.json` restores it.
+**Checked against the thesis:** on `012_026.mp4` (FaceForensics++ C23 test set), the worker's three evaluation-anchor
+clip logits for Veni HQ were −7.67 / −2.15 / −3.29 on a CPU in float32, against −7.50 / −2.30 / −2.98 recorded by the
+thesis evaluation for the same checkpoint (bf16 on a GPU).
 
-Everything from here to [Vidi: DFD-FCG](#vidi-dfd-fcg) describes the Video Swin-B models. The two kinds of
-model share decoding, face detection, tracking, the timeline and the rendering of evidence maps.
+Until November 2026 Veni HQ, Veni LQ and Vici served the thesis's standalone Video Swin-B checkpoints and Vidi
+served DFD-FCG (see [Vidi: DFD-FCG](#vidi-dfd-fcg)). The loader still reads both kinds (`arch` `video_swin_b` and
+`dfd_fcg` in `models.json`), so putting their entries back restores them.
+
+## SwinFusion++
+
+`model_server/swinfusionpp.py` holds the thesis's model code layer for layer (`Thesis_Code/src/swinfusionpp/models`:
+`backbones.py`, `fusion.py`, `principal.py`), so the checkpoints load with `strict=True`:
+
+- **Input:** the same 16-frame clips of 224 × 224 aligned faces as the Video Swin-B models below, normalized with
+  the checkpoint's own mean and standard deviation.
+- **Spatial encoder:** torchvision Swin-B on each of the 16 frames, with taps after the last block of each stage.
+- **Temporal encoder:** torchvision Video Swin-B on the clip (8 tubelets of 2 frames), with taps after each stage.
+- **TLBG-HCA:** at each stage the spatial features are aligned to the 8 tubelets by a depthwise temporal
+  convolution, both streams are projected (64 / 128 / 256 / 256 dimensions, 2 / 4 / 8 / 8 heads), and within local
+  7 × 7 windows each stream attends to the other (bidirectional cross-attention), added through learned scalar gates,
+  followed by gated feed-forward layers. Each stage reads out mean- and max-pooled agreement and disagreement
+  evidence (both streams, their absolute difference and their product).
+- **Head:** the four stage readouts (4 × 256) go through LayerNorm → 512 → GELU → 1 clip logit.
+- **Scoring:** as for every 16-frame model here: mean clip logit → `sigmoid(mean / T)` → threshold. On the GPU the
+  model runs in bf16 under autocast, as in the thesis evaluation. A batch holds half as many clips as a Video Swin-B
+  batch, since both encoders run on every clip.
+- **Evidence maps:** the head pools and ends in a two-layer classifier, so the logit does not split exactly into
+  per-token contributions. The maps are Grad-CAM on the stage-4 features of both encoders (the 7 × 7 grids the last
+  fusion stage reads): channels weighted by the mean gradient of the clip logit, the spatial encoder's 16 frames
+  averaged in pairs onto the 8 tubelets, and the two maps added. Only the fusion head is differentiated, and only for
+  the clips that are shown.
+
+Everything from here to [Vidi: DFD-FCG](#vidi-dfd-fcg) describes the pipeline shared by the 16-frame models
+(SwinFusion++ and Video Swin-B). Both share decoding, face detection, tracking, the timeline and the rendering of
+evidence maps with DFD-FCG.
 
 ## Preprocessing: the frozen thesis contract, on the GPU
 
@@ -142,7 +174,8 @@ already includes the single-pass DFD-FCG crops. With 4 at once the 12 CPU cores 
 
 ## Vidi: DFD-FCG
 
-Since October 2026, Vidi is DFD-FCG: Han, Huang, Hua and Chen, *Towards More General Video-based Deepfake
+**No longer served** (since November 2026 Vidi is SwinFusion++ trained on Celeb-DF v2); kept here because the
+loader still supports it. From October to November 2026, Vidi was DFD-FCG: Han, Huang, Hua and Chen, *Towards More General Video-based Deepfake
 Detection through Facial Component Guided Adaptation for Foundation Model* (CVPR 2025,
 [code](https://github.com/aiiu-lab/DFD-FCG), [paper](https://arxiv.org/abs/2404.05583)). The worker serves the
 authors' published checkpoint, trained on FaceForensics++ C23, unchanged (`weights.ckpt` from their
@@ -215,7 +248,7 @@ RTX 5090 instead of 48 s (2-minute 1080p60: 54 s instead of 84 s).
 Repository layout (this repo is public and holds code only):
 
 - `worker.py`, `requirements.txt`: the Vast PyWorker. The template's `PYWORKER_REPO` points at this repo.
-- `model_server/`: the model API (`app.py`), the face pipeline and Video Swin detector (`detector.py`), DFD-FCG (`dfd_fcg.py`), registry (`models.json`) and weight downloader (`fetch_weights.py`).
+- `model_server/`: the model API (`app.py`), the face pipeline and scoring (`detector.py`), SwinFusion++ (`swinfusionpp.py`), DFD-FCG (`dfd_fcg.py`, not served), registry (`models.json`) and weight downloader (`fetch_weights.py`).
 - `Dockerfile`, `onstart.sh`: the worker image, built by `.github/workflows/build-image.yml` into `ghcr.io/<owner>/originai-worker`. The image also holds the public FaceNet and 2D-FAN weights, checked by hash.
 
 The checkpoints stay private in the Backblaze bucket. Each worker downloads them at start with a read-only key (`B2_KEY_ID`, `B2_APP_KEY` in the Vast template) and checks every file's SHA-1 against `models.json`.
@@ -270,7 +303,8 @@ ORIGINAI_WEIGHTS_DIR=../../models ORIGINAI_MODELS=veni-hq ORIGINAI_DEVICE=cpu OM
 `ORIGINAI_WEIGHTS_DIR` points the server at the local checkpoints in the project's `models/` folder
 (without it, it looks in `model_server/weights/`, where the Vast workers download them).
 
-`ORIGINAI_MODELS` loads only the listed models. One Video Swin model on CPU uses about 1.5 GB of RAM and analyzes a 16-second clip in about a minute.
+`ORIGINAI_MODELS` loads only the listed models. One SwinFusion++ model on CPU (12 threads) uses about 3 GB of RAM
+and analyzes a 12-second clip in about 3 minutes; use the pinned `av` version from `model_server/requirements.txt`.
 
 For Vidi (`ORIGINAI_MODELS=vidi`) also point `ORIGINAI_FAN_WEIGHTS` at the 2D-FAN file
 (`2DFAN4-cd938726ad.zip`, see the Dockerfile) and use the pinned `av` version from `model_server/requirements.txt`.

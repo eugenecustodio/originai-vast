@@ -1,8 +1,10 @@
 """The deepfake detectors: face pipeline on the GPU, every-frame scoring, evidence maps.
 
-Two kinds of model are served (``arch`` in models.json): the thesis's Video Swin-B
-detectors, described below, and DFD-FCG (dfd_fcg.py), which reads its own face crop and
-10-frame clips but shares the decoding, face detection, tracking, timeline and rendering.
+Three kinds of model can be served (``arch`` in models.json): SwinFusion++ (swinfusionpp.py:
+Swin-B + Video Swin-B fused by TLBG-HCA, the thesis model), the thesis's standalone Video
+Swin-B, described below, and DFD-FCG (dfd_fcg.py), which reads its own face crop and
+10-frame clips. SwinFusion++ and Video Swin-B take the same 16-frame face clips; all three
+share the decoding, face detection, tracking, timeline and rendering.
 
 Preprocessing reproduces the training repository
 (Thesis_Code/src/swinfusionpp/preprocessing.py, policy ``preprocessing_v001``) with the
@@ -57,6 +59,7 @@ from torchvision.io import encode_jpeg
 from torchvision.models.video import swin3d_b
 
 import dfd_fcg
+import swinfusionpp
 from gpu_mtcnn import detect_faces
 from video_io import nvdec_diagnostics, open_source
 
@@ -1189,6 +1192,8 @@ class DetectorService:
             arch = m.get("arch", "video_swin_b")
             if arch == "dfd_fcg":
                 net, ckpt = dfd_fcg.load_dfd_fcg(weights_dir / m["checkpoint"], self.device)
+            elif arch == "swinfusionpp":
+                net, ckpt = swinfusionpp.load_swinfusionpp(weights_dir / m["checkpoint"], self.device)
             else:
                 net, ckpt = load_model(weights_dir / m["checkpoint"], self.device)
             self.models[m["id"]] = ModelEntry(
@@ -1285,6 +1290,40 @@ class DetectorService:
         return logits, self._handover(maps)
 
     @torch.inference_mode()
+    def _score_sfpp(self, net: swinfusionpp.SwinFusionPlusPlus, crops: torch.Tensor,
+                    clip_index: torch.Tensor) -> tuple[np.ndarray, None]:
+        """SwinFusion++ clip logits. Both encoders run on every clip, so a batch holds half as many clips as a
+        Video Swin-B batch. Evidence maps are computed later, only for the clips shown (``_evidence_sfpp``)."""
+        batch = max(1, self.batch_size // 2)
+        logits = []
+        with self._model_pass():
+            for i in range(0, len(clip_index), batch):
+                x = crops[clip_index[i : i + batch]].permute(0, 1, 4, 2, 3)  # B,T,C,H,W uint8
+                with self._autocast():
+                    logits.append(net(x).float())
+            logits = torch.cat(logits).double().cpu().numpy()
+        return logits, None
+
+    def _evidence_sfpp(self, net: swinfusionpp.SwinFusionPlusPlus, crops: torch.Tensor,
+                       clip_index: torch.Tensor) -> torch.Tensor:
+        """Grad-CAM maps (K x 8 x 7 x 7) for a few SwinFusion++ clips; see swinfusionpp.py."""
+        maps = []
+        with self._model_pass():
+            for row in clip_index:
+                # A plain copy: the crops are inference-mode tensors, which autograd may not record.
+                x = crops[row[None]].permute(0, 1, 4, 2, 3).clone()
+                maps.append(net.evidence(x, self._autocast() if self.amp_dtype is not None else None)[1])
+            maps = torch.cat(maps)
+        return self._handover(maps)
+
+    def _clip_scores(self, entry: ModelEntry, crops: torch.Tensor,
+                     clip_index: torch.Tensor) -> tuple[np.ndarray, torch.Tensor | None]:
+        """Clip logits of a 16-frame model, with its evidence maps when they come free with the scores."""
+        if entry.arch == "swinfusionpp":
+            return self._score_sfpp(entry.net, crops, clip_index)
+        return self._score(entry.net, crops, clip_index)
+
+    @torch.inference_mode()
     def _score_fcg(self, net: dfd_fcg.DfdFcg, crops: torch.Tensor, clip_index: torch.Tensor,
                    evidence: bool = True) -> tuple[np.ndarray, np.ndarray, torch.Tensor | None]:
         """DFD-FCG clip scores: fake probabilities, their log-odds and, if asked for, each
@@ -1313,8 +1352,11 @@ class DetectorService:
         crops = torch.randint(0, 255, (self.clip_length, self.faces.size, self.faces.size, 3), dtype=torch.uint8, device=self.device)
         self.faces._embed(crops[:2])
         index = torch.arange(self.clip_length, device=self.device)[None]
-        for entry in [e for e in self.models.values() if e.arch == "video_swin_b"][:1]:
-            self._score(entry.net, crops, index)
+        for arch in ("video_swin_b", "swinfusionpp"):
+            for entry in [e for e in self.models.values() if e.arch == arch][:1]:
+                self._clip_scores(entry, crops, index)
+                if arch == "swinfusionpp":
+                    self._evidence_sfpp(entry.net, crops, index)
         for entry in [e for e in self.models.values() if e.arch == "dfd_fcg"][:1]:
             for _ in range(3):  # TorchScript profiles a shape on its first runs and optimises after
                 self.faces.landmarker(frames, [0, 1], np.array([[200.0, 80.0, 440.0, 320.0]] * 2))
@@ -1565,7 +1607,11 @@ class DetectorService:
             if hc.get("include_lowest") and len(order) > len(chosen) and int(bucket[lowest]) not in used_buckets:
                 chosen.append((lowest, "lowest"))
             sign = 1.0 if readout["pred"] == "DEEPFAKE" else -1.0
-            maps = sign * contributions[torch.tensor([i for i, _ in chosen], device=self.device)].float()
+            if contributions is None:  # SwinFusion++: Grad-CAM for the chosen clips only
+                index = torch.tensor([[c.crop_index for c in clips[i]] for i, _ in chosen], device=self.device)
+                maps = sign * self._evidence_sfpp(entry.net, video.crops, index).float()
+            else:
+                maps = sign * contributions[torch.tensor([i for i, _ in chosen], device=self.device)].float()
             flat = maps.flatten()
             low = torch.quantile(flat, float(hc["low_percentile"]) / 100.0)
             high = torch.quantile(flat, float(hc["high_percentile"]) / 100.0)
@@ -1587,6 +1633,7 @@ class DetectorService:
                 })
             heatmaps = {
                 "method": ("Patch contributions to the DFD-FCG heads" if fcg
+                           else "Grad-CAM (final stage of both SwinFusion++ encoders)" if contributions is None
                            else "Class activation map (final Video Swin stage)"),
                 "target": readout["pred"],
                 "scale": "relative within this video",
@@ -1655,7 +1702,7 @@ class DetectorService:
             if len(anchors) != int(evidence["evaluation_clip_count"]):
                 raise AnalysisFailed("insufficient_valid_clips")
             index = torch.tensor([[selected[i].crop_index for i in a] for a in anchors], device=self.device)
-            logits, _ = self._score(entry.net, video.crops, index)
+            logits, _ = self._clip_scores(entry, video.crops, index)
             protocol.update(self._readout(entry, logits))
             protocol.update(available=True, clip_logits=[float(v) for v in logits], track_frames=len(p_track))
         except AnalysisFailed as exc:
@@ -1685,7 +1732,7 @@ class DetectorService:
 
         t = time.perf_counter()
         index = torch.tensor([[c.crop_index for c in clip] for clip in clips], device=self.device)
-        logits, contributions = self._score(entry.net, video.crops, index)
+        logits, contributions = self._clip_scores(entry, video.crops, index)
         self._sync()
         timings["inference"] = time.perf_counter() - t
         return {
@@ -1709,6 +1756,6 @@ class DetectorService:
             crops = torch.randint(0, 255, (self.clip_length * 2, size, size, 3), dtype=torch.uint8, device=self.device)
             index = torch.arange(self.clip_length * 2, device=self.device).view(2, self.clip_length)
             t = time.perf_counter()
-            logits, _ = self._score(entry.net, crops, index)
+            logits, _ = self._clip_scores(entry, crops, index)
             self._sync()
             return {"seconds": time.perf_counter() - t, "logits": [float(v) for v in logits]}

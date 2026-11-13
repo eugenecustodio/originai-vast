@@ -1,7 +1,7 @@
 {
-  "_comment": "Served checkpoints. arch says which code reads a checkpoint: video_swin_b (the default, detector.py) or dfd_fcg (dfd_fcg.py). For the Video Swin-B models, temperature/threshold come from each '<name> - operating point.json' (validation temperature scaling + max-Youden threshold on the calibrated probability) and frame_spacing_s = median per-video frame spacing of that model's training split (preprocessing_materialization_v001.parquet). Vidi is DFD-FCG (Han et al., CVPR 2025; the authors' published checkpoint, trained on FaceForensics++ C23, research use only): it has no validation run of ours, so it is read at its own decision rule (temperature 1, threshold 0.5), and its frame_spacing_s is the spacing of its 10 training frames over 3 seconds.",
+  "_comment": "Served checkpoints. All four detectors are SwinFusion++ (arch swinfusionpp, swinfusionpp.py: Swin-B + Video Swin-B fused by TLBG-HCA), the thesis's fixed-recipe runs (fixed_v002). For each dataset the seed with the highest validation Youden's J was chosen (ties: lower validation BCE); temperature and threshold are that run's own validation_operating_point_v001.json (temperature scaling + max-Youden threshold on the calibrated probability), fitted before any test video was scored. frame_spacing_s = median per-video frame spacing of the training split (preprocessing_materialization_v001.parquet). The loader also still reads arch video_swin_b (detector.py) and dfd_fcg (dfd_fcg.py) entries.",
   "weights_source": {
-    "_comment": "Private Backblaze B2 bucket; workers download each checkpoint at start with a read-only key (B2_KEY_ID / B2_APP_KEY) and verify its SHA-1. These are byte-identical to the local checkpoint files. DFD-FCG.ckpt is weights.ckpt from the authors' checkpoint.zip, unchanged.",
+    "_comment": "Private Backblaze B2 bucket; workers download each checkpoint at start with a read-only key (B2_KEY_ID / B2_APP_KEY) and verify its SHA-1. These are byte-identical to the local checkpoint files.",
     "provider": "backblaze-b2",
     "bucket": "salik-digma"
   },
@@ -9,47 +9,50 @@
     {
       "id": "veni-hq",
       "name": "Veni HQ",
+      "arch": "swinfusionpp",
       "dataset": "FaceForensics++ C23 (HQ)",
-      "checkpoint": "FF++ C23.pt",
-      "temperature": 1.9924885052003003,
-      "threshold": 0.5248124511241848,
+      "checkpoint": "SwinFusion++ FF++ C23.pt",
+      "temperature": 1.8250595918004884,
+      "threshold": 0.6629230724944791,
       "frame_spacing_s": 0.34,
-      "b2_path": "Thesis_Code/results/within__ffpp_c23__video_swin_b__fixed_v002__seed3109/checkpoints/selected.pt",
-      "sha1": "e74a4493847d8cf8f9389b4cb394a9fce91637b1"
+      "b2_path": "Thesis_Code/results/within__ffpp_c23__swinfusionpp__fixed_v002__seed1701/checkpoints/selected.pt",
+      "sha1": "8e5bcb5f98b97ad8c3b2c1a6d7442429406e22fd"
     },
     {
       "id": "veni-lq",
       "name": "Veni LQ",
+      "arch": "swinfusionpp",
       "dataset": "FaceForensics++ C40 (LQ)",
-      "checkpoint": "FF++ C40.pt",
-      "temperature": 2.5594629377233202,
-      "threshold": 0.48931823188817947,
+      "checkpoint": "SwinFusion++ FF++ C40.pt",
+      "temperature": 3.4813872974811155,
+      "threshold": 0.6199200076898764,
       "frame_spacing_s": 0.34,
-      "b2_path": "Thesis_Code/results/within__ffpp_c40__video_swin_b__fixed_v002__seed1701/checkpoints/selected.pt",
-      "sha1": "8f46ddfb455369edc68bf53d10cb32f90afad798"
+      "b2_path": "Thesis_Code/results/within__ffpp_c40__swinfusionpp__fixed_v002__seed2203/checkpoints/selected.pt",
+      "sha1": "1a094a52229be80ce38c371f95cb888376933864"
     },
     {
       "id": "vidi",
       "name": "Vidi",
-      "arch": "dfd_fcg",
-      "dataset": "FaceForensics++ C23 (DFD-FCG)",
-      "checkpoint": "DFD-FCG.ckpt",
-      "temperature": 1.0,
-      "threshold": 0.5,
-      "frame_spacing_s": 0.33,
-      "b2_path": "OriginAI/models/dfd-fcg/weights.ckpt",
-      "sha1": "e3bbb42930560ef351af93750950464cd7f8d9e2"
+      "arch": "swinfusionpp",
+      "dataset": "Celeb-DF v2",
+      "checkpoint": "SwinFusion++ Celeb-DF v2.pt",
+      "temperature": 5.048615464522549,
+      "threshold": 0.3666147990601896,
+      "frame_spacing_s": 0.245,
+      "b2_path": "Thesis_Code/results/within__celeb_df_v2__swinfusionpp__fixed_v002__seed2203/checkpoints/selected.pt",
+      "sha1": "ae9c3f8ed220fdf002bc75d9a1bf68ad6d8ae08a"
     },
     {
       "id": "vici",
       "name": "Vici",
+      "arch": "swinfusionpp",
       "dataset": "DeeperForensics-1.0",
-      "checkpoint": "DeeperForensics-1.0.pt",
-      "temperature": 1.395588533559042,
-      "threshold": 0.8321618813027107,
+      "checkpoint": "SwinFusion++ DeeperForensics-1.0.pt",
+      "temperature": 1.8368039002739296,
+      "threshold": 0.9236851793557208,
       "frame_spacing_s": 0.345,
-      "b2_path": "Thesis_Code/results/within__deeperforensics_1_0__video_swin_b__fixed_v002__seed2203/checkpoints/selected.pt",
-      "sha1": "9bf3217532bc09f8ff35c3aea236fba1d59d6c0a"
+      "b2_path": "Thesis_Code/results/within__deeperforensics_1_0__swinfusionpp__fixed_v002__seed3109/checkpoints/selected.pt",
+      "sha1": "b150a81db152ce51ecd1cdf0a560867106e72c42"
     }
   ],
   "policy": {
@@ -126,7 +129,7 @@
     "gpu_decode": false
   },
   "heatmap": {
-    "_comment": "Evidence maps: exact final-stage token contributions for the top_k most suspicious clips (spread over the video) + the least suspicious, oriented toward the verdict, rendered and JPEG-encoded on the GPU. Shown relative to this video: values at or below low_percentile are clear, high_percentile is full strength.",
+    "_comment": "Evidence maps (SwinFusion++: Grad-CAM on both encoders' stage-4 features; Video Swin-B: exact final-stage token contributions) for the top_k most suspicious clips (spread over the video) + the least suspicious, oriented toward the verdict, rendered and JPEG-encoded on the GPU. Shown relative to this video: values at or below low_percentile are clear, high_percentile is full strength.",
     "top_k": 4,
     "include_lowest": true,
     "low_percentile": 50,
