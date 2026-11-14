@@ -24,7 +24,7 @@ Each phase is tiled into 16-frame clips, so every face frame is scored once, alw
 the trained frame spacing. The verdict follows the thesis read-out over all clips:
 mean clip logit -> sigmoid(logit / T) -> threshold.
 
-The exact thesis evaluation (64 timestamps -> 48 tracked frames -> three anchors) is
+The exact thesis evaluation (64 timestamps -> 48 tracked frames -> seven anchors) is
 reported alongside as ``protocol``.
 
 Evidence maps: the Video Swin-B head is LayerNorm -> mean pool -> linear, so each
@@ -698,7 +698,9 @@ def map_normalized_anchors(frame_count: int, clip_length: int, normalized_starts
 
 
 def evaluation_anchors(frame_count: int, clip_length: int, clip_count: int) -> list[list[int]]:
-    if frame_count < clip_length * clip_count:
+    # The thesis anchors may overlap: seven 16-frame clips at normalized starts 0, 1/6, ..., 1 over the
+    # 48 selected frames (starts 0, 5, 11, 16, 21, 27, 32). Only a track shorter than one clip fails.
+    if frame_count < clip_length or clip_count <= 0:
         return []
     return map_normalized_anchors(frame_count, clip_length, normalized_anchor_starts(clip_count))
 
@@ -1689,7 +1691,7 @@ class DetectorService:
     def _score_video_swin(self, video: DenseVideo, entry: ModelEntry, dense: list[FrameRecord], phases: int,
                           spacing: float, timings: dict[str, float]) -> dict:
         """Video Swin: the thesis protocol, then every frame in interleaved phases."""
-        # Thesis protocol: 64 -> track -> 48 -> three anchors.
+        # Thesis protocol: 64 -> track -> 48 -> seven anchors.
         t = time.perf_counter()
         evidence = self.policy["evidence"]
         protocol: dict[str, Any] = {"available": False, "clip_count": int(evidence["evaluation_clip_count"])}

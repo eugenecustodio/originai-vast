@@ -29,8 +29,8 @@ with the highest validation Youden's J is served (ties: lower validation BCE); t
 choice. Δ is the median per-video frame spacing of each model's training split
 (`manifests/preprocessing_materialization_v001.parquet`).
 
-**Checked against the thesis:** on `012_026.mp4` (FaceForensics++ C23 test set), the worker's three evaluation-anchor
-clip logits for Veni HQ were −7.67 / −2.15 / −3.29 on a CPU in float32, against −7.50 / −2.30 / −2.98 recorded by the
+**Checked against the thesis:** on `012_026.mp4` (FaceForensics++ C23 test set), the worker's start, middle and end evaluation-anchor
+clip logits (anchors 1, 4 and 7 of the seven) for Veni HQ were −7.67 / −2.15 / −3.29 on a CPU in float32, against −7.50 / −2.30 / −2.98 recorded by the
 thesis evaluation for the same checkpoint (bf16 on a GPU).
 
 Until November 2026 Veni HQ, Veni LQ and Vici served the thesis's standalone Video Swin-B checkpoints and Vidi
@@ -91,7 +91,7 @@ the video is split into **interleaved phases**:
 - **Clips:** each phase is tiled into 16-frame clips, and each phase starts at a different offset so clip centres spread evenly through the video. Every face frame is scored in at least one clip, and always at the trained spacing.
 - **Verdict:** mean of all clip logits → `sigmoid(mean / T)` → threshold, the thesis read-out.
 - **Timeline:** each bar averages the clips centred in a half-clip window.
-- **Benchmark protocol:** the exact thesis evaluation (64 timestamps → 48 tracked frames → three anchors) is reported next to it.
+- **Benchmark protocol:** the exact thesis evaluation (64 timestamps → 48 tracked frames → seven anchors at normalized starts 0, 1/6, …, 1; mean of the seven clip logits) is reported next to it.
 - **Limits:** videos over `max_frames` (7,200) are subsampled evenly. Clips never bridge a face gap longer than 4× the spacing.
 
 Portrait phone videos are rotated upright before face detection.

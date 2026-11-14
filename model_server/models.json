@@ -99,7 +99,7 @@
       "maximum_cached_frames": 48,
       "minimum_valid_frames": 48,
       "clip_length": 16,
-      "evaluation_clip_count": 3
+      "evaluation_clip_count": 7
     }
   },
   "dfd_fcg": {
