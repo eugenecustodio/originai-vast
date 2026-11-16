@@ -74,7 +74,12 @@ FAILURE_MESSAGES = {
     "multiple_face_ambiguity": "Several similar faces made it impossible to follow one person.",
     "insufficient_valid_frames": "A clear face is visible in too few frames to analyze.",
     "insufficient_valid_clips": "A clear face is visible in too few frames to analyze.",
+    "range_too_short": "The chosen part of the video is too short to analyze.",
 }
+
+# Shortest part of a video a visitor may choose (the website asks for at least 3 seconds; this is the
+# worker's own floor, so a bad request fails clearly instead of producing too few frames).
+MIN_WINDOW_SECONDS = 1.0
 
 
 class AnalysisFailed(Exception):
@@ -857,6 +862,12 @@ class DenseVideo:
     preview_scale: float
     timings: dict[str, float]
     canvas: "_CanvasCrops | None" = None  # DFD-FCG: the tracked faces' crops, cut during the pass
+    # The part of the video that was read (the whole video unless the visitor chose a part). Timestamps
+    # and frame numbers everywhere else stay those of the whole video.
+    start_s: float = 0.0
+    end_s: float = 0.0
+    first_frame: int = 0
+    window: bool = False
 
 
 class FacePipeline:
@@ -983,8 +994,11 @@ class FacePipeline:
             state["preview_count"] += 1
         timing["previews"] += self._sync() - t2
 
-    def read(self, path: Path, spacing: float, landmarks: bool = False) -> DenseVideo:
-        """``landmarks``: also find each face's 68 landmarks (DFD-FCG crops the face from them)."""
+    def read(self, path: Path, spacing: float, landmarks: bool = False,
+             window: tuple[float, float] | None = None) -> DenseVideo:
+        """``landmarks``: also find each face's 68 landmarks (DFD-FCG crops the face from them).
+        ``window``: (start, end) in seconds, the part of the video the visitor chose; frames outside it are
+        decoded (the decoders read in order) but not analysed. None reads the whole video."""
         cfg = self.cfg
         decoder_cfg = self.policy["decoder"]
         try:
@@ -997,13 +1011,22 @@ class FacePipeline:
             raise AnalysisFailed("decode_failed")
         if info.duration <= 0:
             raise AnalysisFailed("metadata_error")
+        lo, hi = 0.0, float(info.duration)
+        if window is not None:
+            lo, hi = max(0.0, float(window[0])), min(float(info.duration), float(window[1]))
+            if hi - lo < MIN_WINDOW_SECONDS:
+                raise AnalysisFailed("range_too_short")
+        span = hi - lo
 
-        # Thesis protocol targets: 64 uniform timestamps, first frame at or after each.
-        targets = uniform_timestamps(info.duration, int(decoder_cfg["candidate_frame_count"]), float(decoder_cfg["edge_fraction"]))
+        # Thesis protocol targets: 64 uniform timestamps, first frame at or after each (over the chosen part).
+        targets = lo + uniform_timestamps(span, int(decoder_cfg["candidate_frame_count"]), float(decoder_cfg["edge_fraction"]))
         protocol: list[FrameRecord | None] = [None] * len(targets)
         pointer = 0
         # Dense set: every frame, or every m-th frame for very long / high-fps videos.
-        expected = info.num_frames or int(info.duration * (info.fps or 30.0)) + 1
+        if window is None:
+            expected = info.num_frames or int(info.duration * (info.fps or 30.0)) + 1
+        else:
+            expected = int(span * (info.fps or 30.0)) + 1
         subsample = max(1, math.ceil(expected / int(cfg["max_frames"])))
 
         pw = min(int(cfg["preview_width"]), info.width)
@@ -1027,6 +1050,7 @@ class FacePipeline:
         pending_records: list[FrameRecord] = []
         dense_count = 0
         decoded = 0
+        first_frame, last_frame = -1, -1
         batch_size = self._detection_batch(info.height, info.width)
 
         def flush() -> None:
@@ -1038,10 +1062,20 @@ class FacePipeline:
         # Decode the next batches in a background thread while the GPU works on this one.
         prefetch = _Prefetcher(source, batch_size, self._stream())
         try:
+            past_end = False
             for data, pts, idx in prefetch:
                 for j in range(len(pts)):
-                    decoded += 1
                     t, index = float(pts[j]), int(idx[j])
+                    if window is not None:
+                        if t + 1e-9 < lo:
+                            continue  # before the chosen part
+                        if t - 1e-9 > hi:
+                            past_end = True  # after it: stop decoding
+                            break
+                    decoded += 1
+                    if first_frame < 0:
+                        first_frame = index
+                    last_frame = index
                     is_dense = index % subsample == 0
                     hits = []
                     while pointer < len(targets) and t + 1e-9 >= targets[pointer]:
@@ -1063,6 +1097,8 @@ class FacePipeline:
                     pending_records.append(record)
                     if len(pending) >= batch_size:
                         flush()
+                if past_end:
+                    break
             flush()
         except AnalysisFailed:
             raise
@@ -1081,7 +1117,8 @@ class FacePipeline:
             started = self._sync()
             state["fan"].finish()
             middle = self._sync()
-            state["canvas"].finish(decoded)
+            # The frame count the crops are bounded by: the whole video's, or up to the chosen part's last frame.
+            state["canvas"].finish(decoded if window is None else last_frame + 1)
             state["timing"]["landmarks"] += middle - started
             state["timing"]["canvas"] += self._sync() - middle
 
@@ -1104,6 +1141,10 @@ class FacePipeline:
             preview_scale=preview_scale,
             timings=dict(state["timing"]),
             canvas=state["canvas"],
+            start_s=lo,
+            end_s=hi,
+            first_frame=max(0, first_frame),
+            window=window is not None,
         )
 
     def track(self, frames: list[FrameRecord], minimum: int, result: TrackResult | None = None) -> tuple[list[Candidate], int]:
@@ -1448,13 +1489,13 @@ class DetectorService:
         }
 
     # -- public API ----------------------------------------------------------
-    def analyze(self, video_path: Path, model_id: str) -> dict:
+    def analyze(self, video_path: Path, model_id: str, window: tuple[float, float] | None = None) -> dict:
         entry = self.models.get(model_id)
         if entry is None:
             raise KeyError(model_id)
         try:
             with self.gate.slot():
-                return self._analyze(video_path, entry)
+                return self._analyze(video_path, entry, window)
         except Exception as exc:
             if not _is_oom(exc):
                 raise
@@ -1462,7 +1503,7 @@ class DetectorService:
         gc.collect()  # the failed attempt's tensors
         with self.gate.slot(exclusive=True):
             torch.cuda.empty_cache()
-            return self._analyze(video_path, entry)
+            return self._analyze(video_path, entry, window)
 
     def status(self) -> dict:
         return {**self.gate.status(), "heavy_slots": self.heavy_slots}
@@ -1518,7 +1559,8 @@ class DetectorService:
         # The authors' evaluation: one clip per whole 3 seconds, 10 frames spread evenly over it.
         t = time.perf_counter()
         by_frame = {c.record.frame_index: row for row, c in enumerate(track)}
-        windows = dfd_fcg.protocol_frames(video.frames_decoded, video.fps or len(dense) / max(video.duration, 1e-6))
+        windows = dfd_fcg.protocol_frames(video.frames_decoded, video.fps or len(dense) / max(video.end_s - video.start_s, 1e-6))
+        windows = [[video.first_frame + frame for frame in w] for w in windows]  # from the chosen part's first frame
         usable = [w for w in windows if all(frame in by_frame for frame in w)]
         protocol: dict[str, Any] = {"available": False, "clip_count": len(usable), "windows": len(windows)}
         if usable:
@@ -1535,18 +1577,18 @@ class DetectorService:
             "face_crops": crops, "face_rows": rows, "geometry": geometry,
         }
 
-    def _analyze(self, video_path: Path, entry: ModelEntry) -> dict:
+    def _analyze(self, video_path: Path, entry: ModelEntry, window: tuple[float, float] | None = None) -> dict:
         timings: dict[str, float] = {}
         t0 = time.perf_counter()
         hc = self.heatmap_cfg
         fcg = entry.arch == "dfd_fcg"
-        video = self.faces.read(video_path, entry.frame_spacing_s, landmarks=fcg)
+        video = self.faces.read(video_path, entry.frame_spacing_s, landmarks=fcg, window=window)
         self._sync()
         timings["decode_detect_align"] = time.perf_counter() - t0
         timings.update({f"stage_{k}": v for k, v in video.timings.items()})
 
         dense = [r for r in video.records if r.dense_pos >= 0]
-        fps_eff = (video.fps or (len(dense) / max(video.duration, 1e-6))) / video.subsample
+        fps_eff = (video.fps or (len(dense) / max(video.end_s - video.start_s, 1e-6))) / video.subsample
         phases = max(1, int(round(entry.frame_spacing_s * fps_eff)))
         spacing = phases / fps_eff
         if fcg:
@@ -1682,6 +1724,8 @@ class DetectorService:
                 "analyzed_start_s": round(float(starts.min()), 3) if len(clips) else None,
                 "analyzed_end_s": round(float(ends.max()), 3) if len(clips) else None,
                 "fallback": whole_failure,
+                # The part of the video that was checked: the whole video unless the visitor chose a part.
+                "window": {"start_s": round(video.start_s, 3), "end_s": round(video.end_s, 3), "chosen": video.window},
             },
             "meta": {"width": video.width, "height": video.height, "fps": video.fps, "duration": round(video.duration, 3)},
             "heatmaps": heatmaps,

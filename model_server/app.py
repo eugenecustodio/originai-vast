@@ -4,7 +4,8 @@ Routes (JSON only; the Vast PyWorker forwards JSON payloads):
   GET  /health
   GET  /models
   POST /analyze   {"model": "<id>", "video_b64": "<base64>" | "video_url": "https://...",
-                   "filename": "clip.mp4"}
+                   "filename": "clip.mp4", "start_s": 12.0, "end_s": 20.0}
+                  start_s / end_s are optional: the part of the video to check (whole video if left out)
                   {"benchmark": true, "model": "<id>"}  -> synthetic GPU pass (used by the
                    PyWorker readiness benchmark; no video needed)
 
@@ -17,6 +18,7 @@ from __future__ import annotations
 import base64
 import binascii
 import logging
+import math
 import os
 import tempfile
 import time
@@ -66,6 +68,18 @@ class AnalyzeRequest(BaseModel):
     video_url: str | None = None
     filename: str | None = None
     benchmark: bool = False
+    start_s: float | None = None  # the part of the video to check; both or neither
+    end_s: float | None = None
+
+
+def _window(req: AnalyzeRequest) -> tuple[float, float] | None:
+    if req.start_s is None and req.end_s is None:
+        return None
+    if req.start_s is None or req.end_s is None:
+        raise HTTPException(400, "Give both start_s and end_s, or neither.")
+    if not (math.isfinite(req.start_s) and math.isfinite(req.end_s)) or req.start_s < 0 or req.end_s <= req.start_s:
+        raise HTTPException(400, "start_s and end_s must be seconds with 0 <= start_s < end_s.")
+    return float(req.start_s), float(req.end_s)
 
 
 @app.get("/health")
@@ -131,11 +145,12 @@ def analyze(req: AnalyzeRequest) -> dict:
             raise HTTPException(500, "Benchmark failed on the model server.")
         return {"status": "completed", "benchmark": True, **result}
 
+    window = _window(req)
     t = time.time()
     with tempfile.TemporaryDirectory() as tmp:
         video_path = _write_video(req, Path(tmp))
         try:
-            result = service.analyze(video_path, req.model)
+            result = service.analyze(video_path, req.model, window)
         except AnalysisFailed as exc:
             log.info("Analysis failed: %s (%s)", exc.reason, exc)
             return {"status": "failed", "reason": exc.reason, "error": str(exc)}
@@ -146,8 +161,8 @@ def analyze(req: AnalyzeRequest) -> dict:
     result["seconds"] = round(time.time() - t, 2)
     coverage = result.get("coverage", {})
     log.info(
-        "Analyzed with %s: %s p=%.4f frames=%s clips=%s decoder=%s in %.1fs %s",
-        req.model, result["pred"], result["prob_fake"], coverage.get("frames_analyzed"),
+        "Analyzed with %s%s: %s p=%.4f frames=%s clips=%s decoder=%s in %.1fs %s",
+        req.model, f" ({window[0]:.1f}-{window[1]:.1f} s)" if window else "", result["pred"], result["prob_fake"], coverage.get("frames_analyzed"),
         coverage.get("clips"), coverage.get("decoder"), result["seconds"], result.get("timings"),
     )
     return result
